@@ -1,0 +1,10 @@
+[Desktop Entry]
+Name=XInput Pseudo-Seating Control Panel
+Comment=Manage MPX dual-seat workstations and locked Firefox kiosks
+Exec=/home/aelaf/Projects/xinput/start.sh
+Icon=preferences-desktop-display
+Terminal=false
+Type=Application
+Categories=System;Settings;HardwareSettings;
+Keywords=multiseat;xinput;kiosk;firefox;seating;
+StartupNotify=true
