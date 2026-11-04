@@ -93,14 +93,19 @@ class ConfigManager:
 
     def auto_generate_config(self, device_manager) -> Dict:
         """
-        Auto-populates configuration from current connected hardware.
+        Auto-populates configuration from current connected hardware,
+        identifying screen resolutions and connected USB input devices.
+        Preserves custom URLs and kiosk preferences if config already exists.
         """
         auto_map = device_manager.auto_detect_seat_assignments()
-        cfg = self.get_default_config()
+        cfg = self.load_config() if self.config_path.exists() else self.get_default_config()
+        if not cfg.get("seats") or len(cfg.get("seats", [])) < 2:
+            cfg = self.get_default_config()
 
         # Update Seat 1
         s1 = auto_map.get("seat1", {})
         cfg["seats"][0]["display"] = s1.get("display", "eDP-1")
+        cfg["seats"][0]["resolution"] = s1.get("resolution", "1920x1080")
         cfg["seats"][0]["mouse_id"] = s1.get("mouse_id")
         cfg["seats"][0]["mouse_name"] = s1.get("mouse_name", "")
         cfg["seats"][0]["keyboard_id"] = s1.get("keyboard_id")
@@ -109,6 +114,7 @@ class ConfigManager:
         # Update Seat 2
         s2 = auto_map.get("seat2", {})
         cfg["seats"][1]["display"] = s2.get("display", "HDMI-1")
+        cfg["seats"][1]["resolution"] = s2.get("resolution", "1920x1080")
         cfg["seats"][1]["mouse_id"] = s2.get("mouse_id")
         cfg["seats"][1]["mouse_name"] = s2.get("mouse_name", "")
         cfg["seats"][1]["keyboard_id"] = s2.get("keyboard_id")

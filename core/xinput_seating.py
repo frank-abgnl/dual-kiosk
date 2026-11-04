@@ -2,13 +2,16 @@
 """
 XInput MPX Seating Engine.
 Handles master pointer/keyboard creation, reattachment of slave devices,
-and coordinate transformation matrix calculations to confine mice to monitors.
+and confinement of each seat's master pointer to its monitor.
 """
 
+import os
 import subprocess
 import re
 import logging
 from typing import Dict, List, Optional, Tuple
+
+from core.pointer_barriers import PointerConfiner
 
 logger = logging.getLogger("xinput_seating.engine")
 
@@ -35,7 +38,11 @@ class XInputSeatingEngine:
     CORE_KEYBOARD_ID = 3
 
     def __init__(self):
-        pass
+        # Holds XFixes pointer barriers; they live as long as this process.
+        self.confiner = PointerConfiner()
+        self.seat_keyboards: Dict[str, int] = {}  # seat_id -> master keyboard id
+        self.seat_pointers: Dict[str, int] = {}   # seat_id -> master pointer id
+        self.seat_windows: Dict[str, str] = {}    # seat_id -> kiosk window id
 
     # -----------------------------------------------------------------------
     # Master Pair Management
@@ -89,7 +96,6 @@ class XInputSeatingEngine:
             return ptr_id, kbd_id
 
         # Fallback search if named differently
-        ptr_name = f"{seat_name} pointer"
         for name, data in updated.items():
             if seat_name.lower() in name.lower():
                 return data["pointer_id"], data["keyboard_id"]
@@ -128,8 +134,94 @@ class XInputSeatingEngine:
         return True
 
     # -----------------------------------------------------------------------
-    # Screen Confinement & Coordinate Transformation Matrix
+    # Sibling devices (one physical keyboard = several xinput nodes)
     # -----------------------------------------------------------------------
+    @staticmethod
+    def _usb_parent(dev_id) -> Optional[str]:
+        """Returns the sysfs path of the USB device that owns this xinput node, if any."""
+        out, _, rc = run_command(["xinput", "list-props", str(dev_id)])
+        if rc != 0:
+            return None
+        m = re.search(r'Device Node \(\d+\):\s*"([^"]+)"', out)
+        if not m:
+            return None
+        sys_dev = f"/sys/class/input/{os.path.basename(m.group(1))}/device"
+        try:
+            cur = os.path.realpath(sys_dev)
+        except OSError:
+            return None
+        while cur and cur != "/sys":
+            if os.path.exists(os.path.join(cur, "idVendor")):
+                return cur
+            cur = os.path.dirname(cur)
+        return None
+
+    def attach_with_siblings(self, dev_id: int, master_id, dev_class: str) -> bool:
+        """
+        Reattaches a device AND all other xinput nodes of the same class that belong to
+        the same physical USB device (e.g. 'Keyboard' + 'Keyboard Consumer Control').
+        Otherwise part of the keyboard keeps typing into the other seat.
+        """
+        ok = self.reattach_device(dev_id, master_id)
+        parent = self._usb_parent(dev_id)
+        if not parent:
+            return ok
+        from core.device_manager import DeviceManager
+        _, ptrs, kbds = DeviceManager().get_xinput_hierarchy()
+        for sib in (ptrs if dev_class == "pointer" else kbds):
+            if sib["id"] == dev_id or sib["is_xtest"]:
+                continue
+            if self._usb_parent(sib["id"]) == parent:
+                logger.info(f"Also attaching sibling node {sib['id']} ({sib['name']}) to {master_id}")
+                self.reattach_device(sib["id"], master_id)
+        return ok
+
+    def copy_keyboard_layout(self, target_kbd_master: int):
+        """New master keyboards start with a default layout; copy the core keyboard's."""
+        out, _, rc = run_command(["setxkbmap", "-query"])
+        if rc != 0:
+            return
+        q = dict(
+            (k.strip(), v.strip())
+            for k, v in (l.split(":", 1) for l in out.splitlines() if ":" in l)
+        )
+        cmd = ["setxkbmap", "-device", str(target_kbd_master)]
+        if q.get("layout"):
+            cmd += ["-layout", q["layout"]]
+        if q.get("variant"):
+            cmd += ["-variant", q["variant"]]
+        if q.get("options"):
+            cmd += ["-option", "", "-option", q["options"]]
+        run_command(cmd)
+
+    def focus_seat_keyboard(self, seat_id: str, window_id) -> bool:
+        """
+        Binds a seat's kiosk window to its own master pointer/keyboard.
+        1. Client pointer of the browser -> seat's master pointer, so the browser's own
+           focus requests no longer hit the core keyboard.
+        2. Seat keyboard focus -> that window.
+        Every known seat is re-asserted each call, so a freshly opened browser can't
+        leave another seat's keyboard focused on the wrong window.
+        """
+        self.seat_windows[seat_id] = str(window_id)
+        ok = True
+        for sid, win in list(self.seat_windows.items()):
+            ptr = self.seat_pointers.get(sid)
+            kbd = self.seat_keyboards.get(sid)
+            if ptr is not None:
+                self.confiner.set_client_pointer(win, ptr)
+            if kbd is not None:
+                ok = self.confiner.set_focus(kbd, win) and ok
+        return ok
+
+    # -----------------------------------------------------------------------
+    # Screen Confinement
+    # -----------------------------------------------------------------------
+    def _is_absolute(self, dev_id) -> bool:
+        """True for tablets/touchscreens. Normal mice are relative."""
+        out, _, rc = run_command(["xinput", "list", str(dev_id)])
+        return rc == 0 and "mode: absolute" in out.lower()
+
     def map_pointer_to_output(
         self,
         pointer_id: int,
@@ -138,40 +230,24 @@ class XInputSeatingEngine:
         total_screen: Optional[Tuple[int, int]] = None,
     ) -> bool:
         """
-        Maps a pointer device to a specific monitor output.
-        Uses `xinput map-to-output` and calculates Coordinate Transformation Matrix.
-        geometry: (width, height, x_offset, y_offset)
-        total_screen: (total_width, total_height)
+        Maps an *absolute* device (tablet/touchscreen) to a monitor.
+        Relative mice are skipped: the transformation matrix offset has no effect on them
+        (and its scale factor would only slow the mouse down). They are confined with
+        pointer barriers on their master instead (see confine_master).
         """
-        # 1. Native map-to-output
-        cmd = ["xinput", "map-to-output", str(pointer_id), output_name]
-        logger.info(f"Mapping pointer {pointer_id} to output '{output_name}'")
-        _, err, rc = run_command(cmd)
-
-        # 2. Precision Coordinate Transformation Matrix if geometry is known
-        if geometry and total_screen:
-            w, h, x, y = geometry
-            total_w, total_h = total_screen
-            if total_w > 0 and total_h > 0:
-                sx = round(w / total_w, 6)
-                sy = round(h / total_h, 6)
-                ox = round(x / total_w, 6)
-                oy = round(y / total_h, 6)
-
-                matrix_str = f"{sx} 0 {ox} 0 {sy} oy 0 0 1".replace("oy", str(oy))
-                matrix_args = [
-                    "xinput", "set-prop", str(pointer_id),
-                    "--type=float", "Coordinate Transformation Matrix",
-                    str(sx), "0", str(ox),
-                    "0", str(sy), str(oy),
-                    "0", "0", "1"
-                ]
-                logger.info(f"Applying transformation matrix to pointer {pointer_id}: {matrix_str}")
-                _, m_err, m_rc = run_command(matrix_args)
-                if m_rc != 0:
-                    logger.warning(f"Coordinate Transformation Matrix warning: {m_err}")
-
+        if not self._is_absolute(pointer_id):
+            logger.info(f"Device {pointer_id} is relative; skipping output mapping (barriers handle it).")
+            return True
+        _, err, rc = run_command(["xinput", "map-to-output", str(pointer_id), output_name])
+        if rc != 0:
+            logger.warning(f"map-to-output failed for {pointer_id}: {err}")
         return rc == 0
+
+    def confine_master(self, master_ptr_id: int, geometry: Tuple[int, int, int, int],
+                       total_screen: Optional[Tuple[int, int]] = None) -> bool:
+        """geometry = (width, height, x, y)."""
+        w, h, x, y = geometry
+        return self.confiner.confine(master_ptr_id, x, y, w, h, total_screen)
 
     def reset_pointer_matrix(self, pointer_id: int) -> bool:
         """Resets the Coordinate Transformation Matrix of a pointer to identity."""
@@ -191,28 +267,31 @@ class XInputSeatingEngine:
     def reset_all_to_core(self) -> bool:
         """
         Restores standard single-seat environment:
+        0. Releases pointer barriers.
         1. Reattaches all slave pointers to Virtual core pointer (id=2).
         2. Reattaches all slave keyboards to Virtual core keyboard (id=3).
         3. Resets coordinate transformation matrices.
         4. Removes all custom master pairs.
         """
         logger.info("Resetting all XInput devices to Virtual core...")
+        self.confiner.release_all()
+        self.seat_keyboards.clear()
+        self.seat_pointers.clear()
+        self.seat_windows.clear()
+
         from core.device_manager import DeviceManager
         dm = DeviceManager()
         _, pointers, keyboards = dm.get_xinput_hierarchy()
 
-        # Reattach pointers
         for p in pointers:
             if not p["is_xtest"]:
                 self.reattach_device(p["id"], self.CORE_POINTER_ID)
                 self.reset_pointer_matrix(p["id"])
 
-        # Reattach keyboards
         for k in keyboards:
             if not k["is_xtest"]:
                 self.reattach_device(k["id"], self.CORE_KEYBOARD_ID)
 
-        # Remove custom masters
         masters = self.get_existing_masters()
         for name, data in masters.items():
             if name != "Virtual core":
@@ -224,6 +303,21 @@ class XInputSeatingEngine:
     # -----------------------------------------------------------------------
     # Apply Full Seating Configuration
     # -----------------------------------------------------------------------
+    @staticmethod
+    def find_conflicts(seats_config: List[Dict]) -> List[str]:
+        """Detects the same mouse/keyboard/display assigned to more than one seat."""
+        problems = []
+        for key, label in (("mouse_id", "mouse"), ("keyboard_id", "keyboard"), ("display", "display")):
+            seen = {}
+            for s in seats_config:
+                v = s.get(key)
+                if v in (None, ""):
+                    continue
+                if v in seen:
+                    problems.append(f"{label} {v!r} is assigned to both {seen[v]} and {s.get('id')}")
+                seen[v] = s.get("id")
+        return problems
+
     def apply_seating(
         self,
         seats_config: List[Dict],
@@ -233,11 +327,15 @@ class XInputSeatingEngine:
         """
         Applies a multi-seat configuration:
         - Seat 1 is assigned to Virtual core pointer (2) & keyboard (3).
-        - Seat 2 creates/uses master pair 'Seat2' and attaches assigned devices.
-        - Maps mouse pointers to monitors with boundary confinement.
+        - Seat 2 creates/uses a master pair and attaches assigned devices.
+        - Each seat's master pointer is confined to its monitor with pointer barriers.
         """
         results = {}
         disp_map = {d["name"]: d for d in displays_info} if displays_info else {}
+
+        for problem in self.find_conflicts(seats_config):
+            logger.error(f"Seat config conflict: {problem}")
+            results[f"conflict: {problem}"] = False
 
         for seat in seats_config:
             seat_id = seat.get("id", "seat1")
@@ -252,27 +350,34 @@ class XInputSeatingEngine:
                 master_ptr = self.CORE_POINTER_ID
                 master_kbd = self.CORE_KEYBOARD_ID
             else:
-                # Secondary seat: create master pair
                 master_name = f"Seat_{seat_id.upper()}"
                 ptr_id, kbd_id = self.create_master_pair(master_name)
                 master_ptr = ptr_id or f"{master_name} pointer"
                 master_kbd = kbd_id or f"{master_name} keyboard"
 
-            # Reattach mouse
             if mouse_id:
-                ok_m = self.reattach_device(mouse_id, master_ptr)
-                # Map to output if display provided
-                if display_name and display_name in disp_map:
-                    d_info = disp_map[display_name]
-                    geom = (d_info["width"], d_info["height"], d_info["x"], d_info["y"])
-                    self.map_pointer_to_output(mouse_id, display_name, geom, total_screen)
-                elif display_name:
+                results[f"{seat_id}_mouse"] = self.attach_with_siblings(mouse_id, master_ptr, "pointer")
+                if display_name:
                     self.map_pointer_to_output(mouse_id, display_name)
-                results[f"{seat_id}_mouse"] = ok_m
 
-            # Reattach keyboard
             if keyboard_id:
-                ok_k = self.reattach_device(keyboard_id, master_kbd)
-                results[f"{seat_id}_keyboard"] = ok_k
+                results[f"{seat_id}_keyboard"] = self.attach_with_siblings(keyboard_id, master_kbd, "keyboard")
+
+            if isinstance(master_ptr, int):
+                self.seat_pointers[seat_id] = master_ptr
+            if isinstance(master_kbd, int):
+                self.seat_keyboards[seat_id] = master_kbd
+                if not is_primary:
+                    self.copy_keyboard_layout(master_kbd)
+
+            # Confine the *master* pointer to this seat's monitor.
+            if isinstance(master_ptr, int) and display_name in disp_map:
+                d = disp_map[display_name]
+                if d.get("width") and d.get("height"):
+                    geom = (d["width"], d["height"], d["x"], d["y"])
+                    results[f"{seat_id}_confined"] = self.confine_master(master_ptr, geom, total_screen)
+            else:
+                logger.warning(f"Seat '{seat_id}': display {display_name!r} not found or master unknown; not confined.")
+                results[f"{seat_id}_confined"] = False
 
         return results

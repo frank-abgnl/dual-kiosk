@@ -104,7 +104,6 @@ class XInputMultiseatApp(Gtk.ApplicationWindow):
         # First run check
         if not self.config_mgr.config_path.exists():
             GLib.idle_add(self._show_setup_wizard)
-
     # -----------------------------------------------------------------------
     # InfoBar Notification Helper
     # -----------------------------------------------------------------------
@@ -172,3 +171,4 @@ class XInputMultiseatApp(Gtk.ApplicationWindow):
         logger.info("Window closing. Stopping kiosk watchdog...")
         self.kiosk_mgr.stop_watchdog()
         Gtk.main_quit()
+  

@@ -2,6 +2,8 @@
 """
 XInput Pseudo-Seating & Dual Firefox Kiosk Controller.
 Entry point supporting both full GTK3 GUI and headless CLI execution.
+Features automatic startup recovery after power outages, screen resolution
+auto-identification, and connected USB device auto-assignment.
 """
 
 import sys
@@ -21,32 +23,113 @@ logging.basicConfig(
 logger = logging.getLogger("xinput_seating")
 
 
+def run_uninstall(args):
+    """Full teardown: stop everything, reset XInput, remove configs/launchers."""
+    from core.uninstaller import Uninstaller
+
+    if not args.yes and not args.dry_run:
+        print("This will:")
+        print("  - terminate the control panel, supervisor and all Firefox kiosks")
+        print("  - reattach all input devices to Virtual core and remove Seat masters")
+        if args.keep_config:
+            print("  - keep ~/.config/xinput-seats (--keep-config)")
+        else:
+            print("  - delete ~/.config/xinput-seats (config + Firefox kiosk profiles)")
+        print("  - remove launcher / autostart entries")
+        try:
+            ans = input("Continue? [y/N] ").strip().lower()
+        except EOFError:
+            ans = ""
+        if ans not in ("y", "yes"):
+            print("Aborted.")
+            return
+
+    Uninstaller(keep_config=args.keep_config, dry_run=args.dry_run).run()
+
+
 def run_cli(args):
     """Executes non-GUI command-line actions."""
     from core.device_manager import DeviceManager
     from core.xinput_seating import XInputSeatingEngine
     from core.kiosk_manager import KioskManager
     from core.config_manager import ConfigManager
+    from core.autostart import (
+        is_autostart_enabled,
+        enable_autostart,
+        disable_autostart,
+        toggle_autostart,
+        run_startup_reseat_and_launch,
+    )
 
     dev_mgr = DeviceManager()
     engine = XInputSeatingEngine()
     kiosk_mgr = KioskManager()
     cfg_mgr = ConfigManager()
+    kiosk_mgr.on_window_ready = engine.focus_seat_keyboard
+
+    if args.auto_start:
+        # Automated boot / power outage recovery sequence
+        print("[*] Running automatic boot & reseating sequence...")
+        run_startup_reseat_and_launch()
+        return
+
+    if args.enable_autostart:
+        ok = enable_autostart()
+        if ok:
+            print("[✓] Launch on startup successfully enabled (systemd user service & autostart desktop entry).")
+        else:
+            print("[✗] Failed to enable launch on startup.")
+        return
+
+    if args.disable_autostart:
+        ok = disable_autostart()
+        if ok:
+            print("[✓] Launch on startup successfully disabled.")
+        else:
+            print("[✗] Failed to disable launch on startup.")
+        return
+
+    if args.toggle_autostart:
+        new_state = toggle_autostart()
+        print(f"[✓] Launch on startup is now: {'ENABLED' if new_state else 'DISABLED'}")
+        return
 
     if args.auto:
-        print("[*] Running hardware auto-detection...")
+        print("[*] Running hardware auto-detection (resolutions & USB input devices)...")
         cfg = cfg_mgr.auto_generate_config(dev_mgr)
         print(f"[✓] Auto-configuration saved to {cfg_mgr.config_path}:")
         for s in cfg.get("seats", []):
-            print(f"    - {s['id']}: Display={s['display']}, Mouse={s['mouse_name']} (ID {s['mouse_id']}), Keyboard={s['keyboard_name']} (ID {s['keyboard_id']})")
+            print(
+                f"    - {s['id']}: Display={s.get('display')} (Resolution: {s.get('resolution', 'unknown')}), "
+                f"Mouse={s.get('mouse_name')} (ID {s.get('mouse_id')}), "
+                f"Keyboard={s.get('keyboard_name')} (ID {s.get('keyboard_id')})"
+            )
         return
 
     if args.status:
-        print("=== Displays ===")
+        print("=== Connected Displays & Resolutions ===")
         displays, total = dev_mgr.get_displays()
         for d in displays:
-            print(f"  - {d['name']}: {d['geometry']} (Primary: {d['primary']})")
+            p_flag = " [Primary]" if d.get("primary") else ""
+            print(f"  - {d['name']}: {d['width']}x{d['height']} at offset +{d['x']}+{d['y']}{p_flag}")
         print(f"  Total Canvas: {total['width']}x{total['height']}")
+
+        print("\n=== Connected USB Input Devices ===")
+        usb_pointers = dev_mgr.get_usb_pointers()
+        usb_keyboards = dev_mgr.get_usb_keyboards()
+        if usb_pointers:
+            print("  USB Mice / Pointers:")
+            for p in usb_pointers:
+                print(f"    - ID {p['id']}: {p['name']}")
+        else:
+            print("  USB Mice / Pointers: (none detected)")
+
+        if usb_keyboards:
+            print("  USB Keyboards:")
+            for k in usb_keyboards:
+                print(f"    - ID {k['id']}: {k['name']}")
+        else:
+            print("  USB Keyboards: (none detected)")
 
         print("\n=== XInput Masters ===")
         masters = engine.get_existing_masters()
@@ -59,6 +142,10 @@ def run_cli(args):
             print("  (None running)")
         for seat, st in k_status.items():
             print(f"  - {seat}: PID={st.get('pid')}, WinID={st.get('window_id')}, Running={st.get('running')}")
+
+        print("\n=== Launch on Startup Status ===")
+        autostart_on = is_autostart_enabled()
+        print(f"  Power outage recovery / boot launch: {'ENABLED' if autostart_on else 'DISABLED'}")
         return
 
     if args.stop:
@@ -114,15 +201,32 @@ def main():
     )
     parser.add_argument("--start", action="store_true", help="Start seating mappings and launch dual Firefox kiosks (CLI)")
     parser.add_argument("--stop", action="store_true", help="Stop all kiosks and reset XInput devices to core (CLI)")
-    parser.add_argument("--status", action="store_true", help="Show current displays, XInput masters, and kiosk status")
-    parser.add_argument("--auto", action="store_true", help="Auto-detect hardware and generate seat configuration")
+    parser.add_argument("--status", action="store_true", help="Show current displays, screen resolutions, USB devices, and kiosk status")
+    parser.add_argument("--auto", action="store_true", help="Auto-detect hardware (resolutions & USB devices) and generate seat configuration")
     parser.add_argument("--reset-devices", action="store_true", help="Reset all XInput devices to Virtual core")
     parser.add_argument("--gui", action="store_true", help="Launch full GTK3 Control Panel GUI (default)")
+    parser.add_argument("--auto-start", action="store_true", help="Launch kiosks and reseat automatically on boot / power outage recovery")
+    parser.add_argument("--enable-autostart", "--install-service", action="store_true", help="Enable automatic launch on startup")
+    parser.add_argument("--disable-autostart", action="store_true", help="Disable automatic launch on startup")
+    parser.add_argument("--toggle-autostart", action="store_true", help="Toggle automatic launch on startup")
+    parser.add_argument("--uninstall", action="store_true",
+                        help="Terminate everything, reset XInput, and remove configs/profiles/launchers")
+    parser.add_argument("--yes", "-y", action="store_true", help="Skip the confirmation prompt (with --uninstall)")
+    parser.add_argument("--keep-config", action="store_true",
+                        help="Keep ~/.config/xinput-seats when uninstalling")
+    parser.add_argument("--dry-run", action="store_true", help="Show what --uninstall would do without changing anything")
 
     args = parser.parse_args()
 
+    # Uninstall is handled first without constructing managers
+    if args.uninstall:
+        run_uninstall(args)
+        return
+
     # If any CLI action flag is given, run CLI
-    if args.start or args.stop or args.status or args.auto or args.reset_devices:
+    if (args.start or args.stop or args.status or args.auto or
+            args.reset_devices or args.auto_start or args.enable_autostart or
+            args.disable_autostart or args.toggle_autostart):
         run_cli(args)
         return
 

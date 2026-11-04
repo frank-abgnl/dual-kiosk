@@ -57,6 +57,14 @@ class DashboardTab(Gtk.Box):
         btn_kiosk.connect("clicked", self._on_restart_kiosks)
         tb.pack_start(btn_kiosk, False, False, 0)
 
+        # Launch on Startup Toggle (Power Outage Recovery)
+        from core.autostart import is_autostart_enabled, enable_autostart, disable_autostart
+        self.btn_autostart = Gtk.ToggleButton(label="⚡  Launch on Startup")
+        self.btn_autostart.set_tooltip_text("Automatically reseat displays and USB inputs and launch kiosks on system power recovery")
+        self._updating_autostart_ui = False
+        self.btn_autostart.connect("toggled", self._on_toggle_autostart_btn)
+        tb.pack_start(self.btn_autostart, False, False, 0)
+
         btn_clear = Gtk.Button(label="🧹  Clear Log")
         btn_clear.connect("clicked", lambda _: self.log_buf.set_text(""))
         tb.pack_end(btn_clear, False, False, 0)
@@ -129,15 +137,63 @@ class DashboardTab(Gtk.Box):
             cfg = self.app.config_mgr.load_config()
             num_seats = len(cfg.get("seats", []))
 
-            GLib.idle_add(self._update_ui_cards, num_seats, num_masters, num_displays, running_kiosks)
+            # Autostart status
+            from core.autostart import is_autostart_enabled
+            autostart_on = is_autostart_enabled()
+
+            GLib.idle_add(self._update_ui_cards, num_seats, num_masters, num_displays, running_kiosks, autostart_on)
         except Exception as exc:
             pass
 
-    def _update_ui_cards(self, seats, masters, displays, kiosks):
+    def _update_ui_cards(self, seats, masters, displays, kiosks, autostart_on=False):
         self.card_seats.set_value(f"{seats} Seats", "good" if seats >= 2 else "warn")
         self.card_masters.set_value(f"{masters} Active", "good" if masters >= 2 else "neutral")
         self.card_displays.set_value(f"{displays} Detected", "good" if displays >= 2 else "warn")
         self.card_kiosks.set_value(f"{kiosks} Running", "good" if kiosks >= 2 else "warn" if kiosks == 1 else "neutral")
+
+        # Update autostart button without triggering toggle signal
+        self._updating_autostart_ui = True
+        self.btn_autostart.set_active(autostart_on)
+        if autostart_on:
+            self.btn_autostart.set_label("⚡  Startup Launch: ON")
+            self.btn_autostart.get_style_context().remove_class("btn-danger")
+            self.btn_autostart.get_style_context().add_class("btn-success")
+        else:
+            self.btn_autostart.set_label("⚡  Startup Launch: OFF")
+            self.btn_autostart.get_style_context().remove_class("btn-success")
+        self._updating_autostart_ui = False
+
+    def _on_toggle_autostart_btn(self, btn):
+        if self._updating_autostart_ui:
+            return
+        from core.autostart import enable_autostart, disable_autostart
+        new_state = btn.get_active()
+        if new_state:
+            ok = enable_autostart()
+            if ok:
+                self.append_log("Launch on startup enabled (Power Outage Recovery mode).")
+                self.app.show_info("Startup launch enabled ✓ System will auto-reseat and launch on boot.", 0)
+                btn.set_label("⚡  Startup Launch: ON")
+                btn.get_style_context().add_class("btn-success")
+            else:
+                self.append_log("Failed to enable launch on startup.")
+                self.app.show_info("Failed to enable launch on startup.", 1)
+                self._updating_autostart_ui = True
+                btn.set_active(False)
+                self._updating_autostart_ui = False
+        else:
+            ok = disable_autostart()
+            if ok:
+                self.append_log("Launch on startup disabled.")
+                self.app.show_info("Startup launch disabled.", 0)
+                btn.set_label("⚡  Startup Launch: OFF")
+                btn.get_style_context().remove_class("btn-success")
+            else:
+                self.append_log("Failed to disable launch on startup.")
+                self.app.show_info("Failed to disable launch on startup.", 1)
+                self._updating_autostart_ui = True
+                btn.set_active(True)
+                self._updating_autostart_ui = False
 
     # -----------------------------------------------------------------------
     # Toolbar Actions

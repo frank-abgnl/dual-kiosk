@@ -257,33 +257,89 @@ class DeviceManager:
 
         return devices
 
+    @staticmethod
+    def _is_usb_xinput(dev_id: int) -> bool:
+        """Determines if an xinput node belongs to a physical USB device."""
+        out, _, rc = run_command(["xinput", "list-props", str(dev_id)])
+        if rc != 0 or not out:
+            return False
+        m = re.search(r'Device Node \(\d+\):\s*"([^"]+)"', out)
+        if not m:
+            return False
+        dev_node = m.group(1).strip()
+        sys_dev = Path(f"/sys/class/input/{Path(dev_node).name}/device")
+        try:
+            cur = sys_dev.resolve()
+        except OSError:
+            return False
+        while cur and cur != cur.parent and str(cur) != "/sys":
+            if (cur / "idVendor").exists():
+                return True
+            cur = cur.parent
+        return False
+
+    def get_usb_pointers(self):
+        """Returns non-XTEST slave pointers that are physical USB devices."""
+        pointers = self.get_usable_pointers()
+        return [p for p in pointers if self._is_usb_xinput(p["id"])]
+
+    def get_usb_keyboards(self):
+        """Returns non-XTEST slave keyboards that are physical USB devices."""
+        keyboards = self.get_usable_keyboards()
+        return [k for k in keyboards if self._is_usb_xinput(k["id"])]
+
     # -----------------------------------------------------------------------
     # Auto-Configuration Heuristic
     # -----------------------------------------------------------------------
     def auto_detect_seat_assignments(self):
         """
-        Proposes an automatic assignment for dual seats (Seat 1 and Seat 2):
-        - Seat 1 gets Display 1 (Primary or left-most), Mouse 1, Keyboard 1.
-        - Seat 2 gets Display 2, Mouse 2, Keyboard 2 (if available).
+        Communicates with the system and auto-identifies screen resolutions
+        and assigns connected USB devices (mouses & keyboards) to dual seats:
+        - Seat 1 gets Display 1 (Primary or left-most) with its native resolution,
+          connected USB Mouse 1, connected USB Keyboard 1.
+        - Seat 2 gets Display 2 with its native resolution,
+          connected USB Mouse 2, connected USB Keyboard 2.
+        - Falls back gracefully to other available hardware if fewer than 2 USB devices exist.
         """
         displays, _ = self.get_displays()
-        pointers = self.get_usable_pointers()
-        keyboards = self.get_usable_keyboards()
+        usb_pointers = self.get_usb_pointers()
+        usb_keyboards = self.get_usb_keyboards()
+        all_pointers = self.get_usable_pointers()
+        all_keyboards = self.get_usable_keyboards()
+
+        # Prioritize USB devices, fallback to other usable devices
+        pointers = usb_pointers + [p for p in all_pointers if p not in usb_pointers]
+        keyboards = usb_keyboards + [k for k in all_keyboards if k not in usb_keyboards]
+
+        d1 = displays[0] if len(displays) > 0 else {"name": "eDP-1", "width": 1920, "height": 1080}
+        d2 = displays[1] if len(displays) > 1 else (displays[0] if displays else {"name": "HDMI-1", "width": 1920, "height": 1080})
+
+        m1 = pointers[0] if len(pointers) > 0 else None
+        m2 = pointers[1] if len(pointers) > 1 else (pointers[0] if pointers else None)
+
+        k1 = keyboards[0] if len(keyboards) > 0 else None
+        k2 = keyboards[1] if len(keyboards) > 1 else (keyboards[0] if keyboards else None)
 
         assignment = {
             "seat1": {
-                "display": displays[0]["name"] if len(displays) > 0 else "eDP-1",
-                "mouse_id": pointers[0]["id"] if len(pointers) > 0 else None,
-                "mouse_name": pointers[0]["name"] if len(pointers) > 0 else "",
-                "keyboard_id": keyboards[0]["id"] if len(keyboards) > 0 else None,
-                "keyboard_name": keyboards[0]["name"] if len(keyboards) > 0 else "",
+                "display": d1.get("name", "eDP-1"),
+                "resolution": f"{d1.get('width', 1920)}x{d1.get('height', 1080)}",
+                "width": d1.get("width", 1920),
+                "height": d1.get("height", 1080),
+                "mouse_id": m1["id"] if m1 else None,
+                "mouse_name": m1["name"] if m1 else "",
+                "keyboard_id": k1["id"] if k1 else None,
+                "keyboard_name": k1["name"] if k1 else "",
             },
             "seat2": {
-                "display": displays[1]["name"] if len(displays) > 1 else (displays[0]["name"] if displays else "HDMI-1"),
-                "mouse_id": pointers[1]["id"] if len(pointers) > 1 else (pointers[0]["id"] if pointers else None),
-                "mouse_name": pointers[1]["name"] if len(pointers) > 1 else (pointers[0]["name"] if pointers else ""),
-                "keyboard_id": keyboards[1]["id"] if len(keyboards) > 1 else (keyboards[0]["id"] if keyboards else None),
-                "keyboard_name": keyboards[1]["name"] if len(keyboards) > 1 else (keyboards[0]["name"] if keyboards else ""),
+                "display": d2.get("name", "HDMI-1"),
+                "resolution": f"{d2.get('width', 1920)}x{d2.get('height', 1080)}",
+                "width": d2.get("width", 1920),
+                "height": d2.get("height", 1080),
+                "mouse_id": m2["id"] if m2 else None,
+                "mouse_name": m2["name"] if m2 else "",
+                "keyboard_id": k2["id"] if k2 else None,
+                "keyboard_name": k2["name"] if k2 else "",
             }
         }
         return assignment

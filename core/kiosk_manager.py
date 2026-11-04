@@ -44,8 +44,10 @@ class KioskManager:
         self._watchdog_thread: Optional[threading.Thread] = None
         self._stop_watchdog = threading.Event()
         self._lock = threading.Lock()
+        # Optional hook: callback(seat_id, window_id). Used to give the seat's
+        # keyboard master focus on its kiosk window.
+        self.on_window_ready = None
 
-        # Ensure profile base directories exist
         PROFILES_DIR.mkdir(parents=True, exist_ok=True)
 
     # -----------------------------------------------------------------------
@@ -64,7 +66,6 @@ class KioskManager:
         """
         profile_path = self.get_profile_path(seat_id)
 
-        # 1. Write user.js preferences
         user_js = profile_path / "user.js"
         prefs = f"""// Auto-generated kiosk preferences for seat: {seat_id}
 user_pref("browser.startup.homepage", "{kiosk_url}");
@@ -92,7 +93,6 @@ user_pref("app.update.enabled", false);
         except Exception as exc:
             logger.warning(f"Could not write user.js for {seat_id}: {exc}")
 
-        # 2. Write distribution/policies.json inside the profile
         dist_dir = profile_path / "distribution"
         dist_dir.mkdir(parents=True, exist_ok=True)
         policies_json = dist_dir / "policies.json"
@@ -127,29 +127,29 @@ user_pref("app.update.enabled", false);
     ) -> bool:
         """
         Launches a single Firefox instance in kiosk mode with its dedicated profile.
+        display_geometry = (width, height, x, y). The window is moved to that rectangle
+        by the window manager; Firefox's own --kiosk-monitor is NOT used because it is
+        unreliable on X11/Xwayland and fights with our placement.
         """
         with self._lock:
-            # Stop existing instance if running
             if seat_id in self.running_processes:
                 self._terminate_seat_process(seat_id)
 
             profile_path = self.setup_profile(seat_id, kiosk_url)
 
-            # Build command:
-            # Firefox flags: --new-instance --profile <path> --kiosk [--kiosk-monitor <idx>] <url>
             cmd = [
                 "firefox",
                 "--new-instance",
                 "--profile", str(profile_path),
                 "--kiosk",
-                "--kiosk-monitor", str(monitor_index),
                 kiosk_url,
             ]
 
-            logger.info(f"Launching Firefox Kiosk for '{seat_id}' (monitor {monitor_index}): {' '.join(cmd)}")
+            logger.info(f"Launching Firefox Kiosk for '{seat_id}' (geometry {display_geometry}): {' '.join(cmd)}")
             try:
                 env = os.environ.copy()
-                env.pop("WAYLAND_DISPLAY", None)  # Ensure X11 / Xwayland backend for xinput compatibility
+                env.pop("WAYLAND_DISPLAY", None)  # Force X11 / Xwayland for xinput compatibility
+                env["MOZ_ENABLE_WAYLAND"] = "0"
                 proc = subprocess.Popen(
                     cmd,
                     stdout=subprocess.DEVNULL,
@@ -168,14 +168,13 @@ user_pref("app.update.enabled", false);
                 logger.error(f"Failed to spawn Firefox for seat '{seat_id}': {exc}")
                 return False
 
-        # Apply window enforcement in background thread once window appears
-        if enforce_lock:
-            t = threading.Thread(
-                target=self._enforce_window_after_launch,
-                args=(seat_id, proc.pid, display_geometry),
-                daemon=True,
-            )
-            t.start()
+        # Always place the window on its monitor; lock flags only if enforce_lock.
+        t = threading.Thread(
+            target=self._enforce_window_after_launch,
+            args=(seat_id, proc.pid, display_geometry, enforce_lock),
+            daemon=True,
+        )
+        t.start()
 
         return True
 
@@ -195,21 +194,30 @@ user_pref("app.update.enabled", false);
             self.window_ids.pop(seat_id, None)
 
     # -----------------------------------------------------------------------
-    # Window Constraints Enforcement (Non-Minimizable, Non-Closable, Fullscreen)
+    # Window placement & constraints
     # -----------------------------------------------------------------------
-    def _find_window_id_for_pid(self, pid: int, timeout_sec: int = 6) -> Optional[str]:
-        """Finds the X11 window ID associated with the process PID."""
+    @staticmethod
+    def _window_area(win_id: str) -> int:
+        out, _, rc = run_command(["xdotool", "getwindowgeometry", "--shell", win_id])
+        if rc != 0:
+            return 0
+        vals = dict(l.split("=", 1) for l in out.splitlines() if "=" in l)
+        try:
+            return int(vals.get("WIDTH", 0)) * int(vals.get("HEIGHT", 0))
+        except ValueError:
+            return 0
+
+    def _find_window_id_for_pid(self, pid: int, timeout_sec: int = 15) -> Optional[str]:
+        """Finds the main visible X11 window of the process (largest one wins)."""
         start = time.time()
         while time.time() - start < timeout_sec:
-            # Try xdotool
-            out, _, rc = run_command(["xdotool", "search", "--pid", str(pid)])
+            out, _, rc = run_command(["xdotool", "search", "--onlyvisible", "--pid", str(pid)])
             if rc == 0 and out:
-                # Return the last window id (typically the top-level window)
-                lines = [l.strip() for l in out.splitlines() if l.strip()]
-                if lines:
-                    return lines[-1]
+                ids = [l.strip() for l in out.splitlines() if l.strip()]
+                ids = [i for i in ids if self._window_area(i) > 200 * 200]
+                if ids:
+                    return max(ids, key=self._window_area)
 
-            # Try wmctrl
             out2, _, rc2 = run_command(["wmctrl", "-l", "-p"])
             if rc2 == 0 and out2:
                 for line in out2.splitlines():
@@ -225,8 +233,9 @@ user_pref("app.update.enabled", false);
         seat_id: str,
         pid: int,
         display_geometry: Optional[Tuple[int, int, int, int]] = None,
+        enforce_lock: bool = True,
     ):
-        """Polls for window mapping and applies EWMH lock flags."""
+        """Waits for the window, moves it onto its monitor, then applies lock flags."""
         win_id = self._find_window_id_for_pid(pid)
         if not win_id:
             logger.warning(f"Could not find window ID for seat '{seat_id}' (PID {pid}) within timeout.")
@@ -235,33 +244,44 @@ user_pref("app.update.enabled", false);
         with self._lock:
             self.window_ids[seat_id] = win_id
 
-        logger.info(f"Applying kiosk lock constraints to window {win_id} for seat '{seat_id}'...")
-        self.lock_window(win_id, display_geometry)
+        self._notify_window(seat_id, win_id)  # bind to seat's pointer/keyboard immediately
+        time.sleep(1.0)  # let Firefox finish its own startup fullscreen first
+        logger.info(f"Placing window {win_id} for seat '{seat_id}' at {display_geometry}...")
+        self.place_window(win_id, display_geometry)
+        if enforce_lock:
+            self.lock_window(win_id)
+        self._notify_window(seat_id, win_id)
 
-    def lock_window(self, win_id: str, display_geometry: Optional[Tuple[int, int, int, int]] = None):
+    def _notify_window(self, seat_id: str, win_id: str):
+        cb = self.on_window_ready
+        if cb:
+            try:
+                cb(seat_id, win_id)
+            except Exception as exc:
+                logger.warning(f"on_window_ready failed for {seat_id}: {exc}")
+
+    def place_window(self, win_id: str, display_geometry: Optional[Tuple[int, int, int, int]] = None):
         """
-        Enforces non-minimizable, non-closable, fullscreen, and stays-on-top on an X11 window.
+        Moves the window onto the target monitor and re-fullscreens it there.
+        The WM fullscreens onto whichever monitor the window currently sits on,
+        so the move must be applied (hence the short pauses) before fullscreen is re-added.
         """
-        # 1. If geometry is provided, move and size window to exact monitor bounds
         if display_geometry:
             w, h, x, y = display_geometry
-            # Remove fullscreen briefly to move window
-            run_command(["wmctrl", "-i", "-r", win_id, "-b", "remove,fullscreen"])
+            run_command(["wmctrl", "-i", "-r", win_id, "-b", "remove,fullscreen,maximized_vert,maximized_horz"])
+            time.sleep(0.4)
             run_command(["wmctrl", "-i", "-r", win_id, "-e", f"0,{x},{y},{w},{h}"])
+            run_command(["xdotool", "windowmove", win_id, str(x), str(y)])
+            time.sleep(0.4)
+        run_command(["wmctrl", "-i", "-r", win_id, "-b", "add,fullscreen"])
 
-        # 2. Add Fullscreen and Always on Top
+    def lock_window(self, win_id: str, display_geometry: Optional[Tuple[int, int, int, int]] = None):
+        """Enforces always-on-top and strips close/minimize actions on an X11 window."""
+        if display_geometry:
+            self.place_window(win_id, display_geometry)
+
         run_command(["wmctrl", "-i", "-r", win_id, "-b", "add,fullscreen,above"])
-
-        # 3. Strip Close and Minimize permissions via _NET_WM_ALLOWED_ACTIONS
-        # Setting ALLOWED_ACTIONS exclusively to FULLSCREEN prevents WM close/minimize buttons
         run_command(["xprop", "-id", win_id, "-set", "_NET_WM_ALLOWED_ACTIONS", "_NET_WM_ACTION_FULLSCREEN"])
-
-        # 4. Enforce _NET_WM_STATE
-        run_command([
-            "xprop", "-id", win_id, "-f", "_NET_WM_STATE", "32a",
-            "-set", "_NET_WM_STATE",
-            "_NET_WM_STATE_FULLSCREEN, _NET_WM_STATE_ABOVE, _NET_WM_STATE_STAYS_ON_TOP"
-        ])
 
     def restore_and_unminimize(self, win_id: str):
         """Restores a minimized or hidden kiosk window back to fullscreen."""
@@ -313,7 +333,6 @@ user_pref("app.update.enabled", false);
                     cfg = self.kiosk_configs.get(seat_id, {})
                     win_id = self.window_ids.get(seat_id)
 
-                # Check 1: Did process exit?
                 if proc is None or proc.poll() is not None:
                     if cfg.get("enforce_lock", True):
                         logger.warning(f"[Watchdog] Kiosk process for seat '{seat_id}' terminated! Auto-respawning...")
@@ -326,7 +345,9 @@ user_pref("app.update.enabled", false);
                         )
                     continue
 
-                # Check 2: Was window minimized / hidden?
+                if win_id:
+                    self._notify_window(seat_id, win_id)  # keep per-seat keyboard focus pinned
+
                 if win_id and cfg.get("enforce_lock", True):
                     out, _, rc = run_command(["xprop", "-id", win_id, "_NET_WM_STATE"])
                     if rc == 0 and "_NET_WM_STATE_HIDDEN" in out:
@@ -336,6 +357,34 @@ user_pref("app.update.enabled", false);
     # -----------------------------------------------------------------------
     # Multi-Seat Launch Orchestrator
     # -----------------------------------------------------------------------
+    @staticmethod
+    def _geometry_for_seats(displays_info: Optional[List[Dict]]) -> List[Optional[Tuple[int, int, int, int]]]:
+        """
+        Resolves each seat's monitor geometry from the SAVED SEAT CONFIG (by output name),
+        so the browser lands on the same monitor the seat's pointer is confined to.
+        Falls back to display order only if the configured output is missing.
+        """
+        geoms: List[Optional[Tuple[int, int, int, int]]] = [None, None]
+        if not displays_info:
+            return geoms
+        by_name = {d["name"]: d for d in displays_info}
+
+        try:
+            from core.config_manager import ConfigManager
+            seats = ConfigManager().load_config().get("seats", [])
+        except Exception:
+            seats = []
+
+        for i in range(2):
+            d = None
+            if i < len(seats):
+                d = by_name.get(seats[i].get("display"))
+            if d is None and i < len(displays_info):
+                d = displays_info[i]
+            if d and d.get("width") and d.get("height"):
+                geoms[i] = (d["width"], d["height"], d["x"], d["y"])
+        return geoms
+
     def launch_dual_kiosks(
         self,
         seat1_url: str = "https://duckduckgo.com",
@@ -343,19 +392,11 @@ user_pref("app.update.enabled", false);
         displays_info: Optional[List[Dict]] = None,
         enforce_lock: bool = True,
     ) -> bool:
-        """
-        Launches Seat 1 on Monitor 0 and Seat 2 on Monitor 1 in full kiosk mode.
-        """
-        geom1 = None
-        geom2 = None
-        if displays_info and len(displays_info) >= 1:
-            d0 = displays_info[0]
-            geom1 = (d0["width"], d0["height"], d0["x"], d0["y"])
-        if displays_info and len(displays_info) >= 2:
-            d1 = displays_info[1]
-            geom2 = (d1["width"], d1["height"], d1["x"], d1["y"])
+        """Launches Seat 1 and Seat 2 kiosks, each on the monitor configured for that seat."""
+        geom1, geom2 = self._geometry_for_seats(displays_info)
 
         ok1 = self.launch_kiosk("seat1", seat1_url, monitor_index=0, display_geometry=geom1, enforce_lock=enforce_lock)
+        time.sleep(1.5)  # stagger so window discovery doesn't race between the two instances
         ok2 = self.launch_kiosk("seat2", seat2_url, monitor_index=1, display_geometry=geom2, enforce_lock=enforce_lock)
 
         if enforce_lock:
