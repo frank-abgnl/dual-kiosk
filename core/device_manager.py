@@ -9,6 +9,7 @@ import re
 import glob
 import logging
 from pathlib import Path
+from typing import Dict, List, Optional, Tuple, Set
 
 logger = logging.getLogger("xinput_seating.device_manager")
 
@@ -289,17 +290,160 @@ class DeviceManager:
         return [k for k in keyboards if self._is_usb_xinput(k["id"])]
 
     # -----------------------------------------------------------------------
-    # Auto-Configuration Heuristic
+    # Persistent Peripheral Identification & Resolution
     # -----------------------------------------------------------------------
-    def auto_detect_seat_assignments(self):
+    @staticmethod
+    def get_device_product_id(dev_id: int) -> Optional[Tuple[int, int]]:
+        """Returns (vendor_id, product_id) from xinput list-props, if available."""
+        out, _, rc = run_command(["xinput", "list-props", str(dev_id)])
+        if rc != 0 or not out:
+            return None
+        m = re.search(r'Device Product ID \((\d+)\):\s*(\d+),\s*(\d+)', out)
+        if m:
+            try:
+                return int(m.group(2)), int(m.group(3))
+            except ValueError:
+                return None
+        return None
+
+    def find_device_by_name(
+        self,
+        name: str,
+        dev_class: str = "pointer",
+        exclude_ids: Optional[List[int]] = None,
+        expected_product_id: Optional[Tuple[int, int]] = None,
+    ) -> Optional[Dict]:
         """
-        Communicates with the system and auto-identifies screen resolutions
-        and assigns connected USB devices (mouses & keyboards) to dual seats:
-        - Seat 1 gets Display 1 (Primary or left-most) with its native resolution,
-          connected USB Mouse 1, connected USB Keyboard 1.
-        - Seat 2 gets Display 2 with its native resolution,
-          connected USB Mouse 2, connected USB Keyboard 2.
-        - Falls back gracefully to other available hardware if fewer than 2 USB devices exist.
+        Locates a connected device by matching its peripheral name (and optionally product ID).
+        Prefers exact name match, then substring/case-insensitive match.
+        Guarantees that when a device is replugged on a different USB port and receives a new ID,
+        it is accurately identified and retrieved.
+        """
+        if not name:
+            return None
+
+        exclude: Set[int] = set(exclude_ids or [])
+        candidates = self.get_usb_pointers() if dev_class == "pointer" else self.get_usb_keyboards()
+        if not candidates:
+            candidates = self.get_usable_pointers() if dev_class == "pointer" else self.get_usable_keyboards()
+
+        clean_target = name.strip().lower()
+
+        # 1. Exact name match + expected product ID
+        if expected_product_id:
+            for dev in candidates:
+                if dev["id"] in exclude:
+                    continue
+                if dev["name"].strip().lower() == clean_target:
+                    prod = self.get_device_product_id(dev["id"])
+                    if prod == expected_product_id:
+                        return dev
+
+        # 2. Exact name match
+        for dev in candidates:
+            if dev["id"] in exclude:
+                continue
+            if dev["name"].strip().lower() == clean_target:
+                return dev
+
+        # 3. Substring match (e.g. if driver prefix slightly varies)
+        for dev in candidates:
+            if dev["id"] in exclude:
+                continue
+            dev_clean = dev["name"].strip().lower()
+            if clean_target in dev_clean or dev_clean in clean_target:
+                return dev
+
+        return None
+
+    def resolve_seat_devices(
+        self,
+        seats_config: List[Dict],
+        preserve_memory: bool = True,
+    ) -> Tuple[List[Dict], List[str]]:
+        """
+        Scans current live XInput devices and matches them against each seat's locked peripheral names.
+        - If a device was unplugged and plugged into a different USB port (new ID),
+          its live ID is updated.
+        - If a device is unplugged, it retains its locked name in memory so it can be reseated upon replug.
+        Returns (updated_seats, log_messages).
+        """
+        resolved_seats = []
+        messages = []
+        used_pointer_ids = set()
+        used_keyboard_ids = set()
+
+        for seat in seats_config:
+            s_copy = dict(seat)
+            seat_id = s_copy.get("id", "seat1")
+            disp = s_copy.get("display", "unknown")
+            is_locked = s_copy.get("lock_peripherals", True)
+
+            mouse_name = s_copy.get("mouse_name", "")
+            orig_mouse_id = s_copy.get("mouse_id")
+            mouse_prod = s_copy.get("mouse_product_id")
+
+            kbd_name = s_copy.get("keyboard_name", "")
+            orig_kbd_id = s_copy.get("keyboard_id")
+            kbd_prod = s_copy.get("keyboard_product_id")
+
+            # Resolve Mouse by locked peripheral name
+            live_mouse = self.find_device_by_name(
+                mouse_name, dev_class="pointer", exclude_ids=list(used_pointer_ids), expected_product_id=mouse_prod
+            )
+            if live_mouse:
+                new_m_id = live_mouse["id"]
+                used_pointer_ids.add(new_m_id)
+                s_copy["mouse_id"] = new_m_id
+                s_copy["mouse_connected"] = True
+                s_copy["mouse_name"] = live_mouse["name"]
+                s_copy["mouse_product_id"] = self.get_device_product_id(new_m_id)
+                if orig_mouse_id != new_m_id and orig_mouse_id is not None:
+                    messages.append(
+                        f"Mouse '{live_mouse['name']}' locked to {disp} ({seat_id}) recognized on new port (ID: {orig_mouse_id} -> {new_m_id})"
+                    )
+            else:
+                s_copy["mouse_connected"] = False
+                if mouse_name:
+                    messages.append(f"Mouse '{mouse_name}' locked to {disp} ({seat_id}) is currently unplugged.")
+                if not preserve_memory:
+                    s_copy["mouse_id"] = None
+
+            # Resolve Keyboard by locked peripheral name
+            live_kbd = self.find_device_by_name(
+                kbd_name, dev_class="keyboard", exclude_ids=list(used_keyboard_ids), expected_product_id=kbd_prod
+            )
+            if live_kbd:
+                new_k_id = live_kbd["id"]
+                used_keyboard_ids.add(new_k_id)
+                s_copy["keyboard_id"] = new_k_id
+                s_copy["keyboard_connected"] = True
+                s_copy["keyboard_name"] = live_kbd["name"]
+                s_copy["keyboard_product_id"] = self.get_device_product_id(new_k_id)
+                if orig_kbd_id != new_k_id and orig_kbd_id is not None:
+                    messages.append(
+                        f"Keyboard '{live_kbd['name']}' locked to {disp} ({seat_id}) recognized on new port (ID: {orig_kbd_id} -> {new_k_id})"
+                    )
+            else:
+                s_copy["keyboard_connected"] = False
+                if kbd_name:
+                    messages.append(f"Keyboard '{kbd_name}' locked to {disp} ({seat_id}) is currently unplugged.")
+                if not preserve_memory:
+                    s_copy["keyboard_id"] = None
+
+            s_copy["lock_peripherals"] = is_locked
+            resolved_seats.append(s_copy)
+
+        return resolved_seats, messages
+
+    # -----------------------------------------------------------------------
+    # Auto-Configuration Heuristic (with Memory Retention)
+    # -----------------------------------------------------------------------
+    def auto_detect_seat_assignments(self, existing_seats: Optional[List[Dict]] = None):
+        """
+        Auto-identifies screens and assigns connected USB devices (mouses & keyboards) to dual seats.
+        Retains memory: if existing_seats has locked peripheral names for displays,
+        it preserves those associations even if devices were plugged into different ports.
         """
         displays, _ = self.get_displays()
         usb_pointers = self.get_usb_pointers()
@@ -307,13 +451,29 @@ class DeviceManager:
         all_pointers = self.get_usable_pointers()
         all_keyboards = self.get_usable_keyboards()
 
-        # Prioritize USB devices, fallback to other usable devices
         pointers = usb_pointers + [p for p in all_pointers if p not in usb_pointers]
         keyboards = usb_keyboards + [k for k in all_keyboards if k not in usb_keyboards]
 
         d1 = displays[0] if len(displays) > 0 else {"name": "eDP-1", "width": 1920, "height": 1080}
         d2 = displays[1] if len(displays) > 1 else (displays[0] if displays else {"name": "HDMI-1", "width": 1920, "height": 1080})
 
+        # Check if existing seats already have locked peripheral names to retain
+        has_locked_memory = False
+        if existing_seats and len(existing_seats) >= 2:
+            s1_locked = existing_seats[0].get("lock_peripherals", True) and (
+                existing_seats[0].get("mouse_name") or existing_seats[0].get("keyboard_name")
+            )
+            s2_locked = existing_seats[1].get("lock_peripherals", True) and (
+                existing_seats[1].get("mouse_name") or existing_seats[1].get("keyboard_name")
+            )
+            has_locked_memory = s1_locked or s2_locked
+
+        if has_locked_memory and existing_seats:
+            logger.info("Auto-detection: Preserving memory of locked peripheral names to displays...")
+            resolved, _ = self.resolve_seat_devices(existing_seats, preserve_memory=True)
+            return {s["id"]: s for s in resolved}
+
+        # Clean assignment from connected hardware
         m1 = pointers[0] if len(pointers) > 0 else None
         m2 = pointers[1] if len(pointers) > 1 else (pointers[0] if pointers else None)
 
@@ -322,6 +482,7 @@ class DeviceManager:
 
         assignment = {
             "seat1": {
+                "id": "seat1",
                 "display": d1.get("name", "eDP-1"),
                 "resolution": f"{d1.get('width', 1920)}x{d1.get('height', 1080)}",
                 "width": d1.get("width", 1920),
@@ -330,8 +491,11 @@ class DeviceManager:
                 "mouse_name": m1["name"] if m1 else "",
                 "keyboard_id": k1["id"] if k1 else None,
                 "keyboard_name": k1["name"] if k1 else "",
+                "lock_peripherals": True,
+                "locked_display": d1.get("name", "eDP-1"),
             },
             "seat2": {
+                "id": "seat2",
                 "display": d2.get("name", "HDMI-1"),
                 "resolution": f"{d2.get('width', 1920)}x{d2.get('height', 1080)}",
                 "width": d2.get("width", 1920),
@@ -340,6 +504,8 @@ class DeviceManager:
                 "mouse_name": m2["name"] if m2 else "",
                 "keyboard_id": k2["id"] if k2 else None,
                 "keyboard_name": k2["name"] if k2 else "",
+                "lock_peripherals": True,
+                "locked_display": d2.get("name", "HDMI-1"),
             }
         }
         return assignment

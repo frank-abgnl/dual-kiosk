@@ -47,6 +47,7 @@ class KioskManager:
         # Optional hook: callback(seat_id, window_id). Used to give the seat's
         # keyboard master focus on its kiosk window.
         self.on_window_ready = None
+        self.overlay_seat: Optional[str] = None
 
         PROFILES_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -345,8 +346,8 @@ user_pref("app.update.enabled", false);
                         )
                     continue
 
-                if win_id:
-                    self._notify_window(seat_id, win_id)  # keep per-seat keyboard focus pinned
+                if win_id and (self.overlay_seat != seat_id):
+                    self._notify_window(seat_id, win_id)  # keep per-seat keyboard focus pinned unless overlay is showing
 
                 if win_id and cfg.get("enforce_lock", True):
                     out, _, rc = run_command(["xprop", "-id", win_id, "_NET_WM_STATE"])
@@ -415,6 +416,66 @@ user_pref("app.update.enabled", false);
             self.window_ids.clear()
         logger.info("All kiosk instances stopped.")
 
+    def set_overlay_seat(self, seat_id: Optional[str]):
+        """Sets which seat currently has an active control board overlay, pausing watchdog focus theft."""
+        self.overlay_seat = seat_id
+        logger.info(f"Kiosk watchdog overlay seat set to: {seat_id}")
+
+    def set_kiosk_above(self, seat_id: str, above: bool):
+        """Temporarily adds or removes the 'above' state from a seat's kiosk window."""
+        win_id = self.window_ids.get(seat_id)
+        if not win_id:
+            self.discover_running_kiosks()
+            win_id = self.window_ids.get(seat_id)
+        if win_id:
+            action = "add" if above else "remove"
+            run_command(["wmctrl", "-i", "-r", win_id, "-b", f"{action},above"])
+            logger.info(f"Set kiosk window {win_id} for seat '{seat_id}' above={above}")
+
+    def discover_running_kiosks(self) -> Dict[str, Dict]:
+        """
+        Discovers active Firefox kiosk processes and windows on the system,
+        populating window_ids even if this KioskManager didn't spawn them.
+        """
+        out, _, rc = run_command(["wmctrl", "-l", "-p"])
+        if rc != 0 or not out:
+            return {}
+
+        discovered = {}
+        for line in out.splitlines():
+            parts = line.split()
+            if len(parts) >= 3:
+                win_id = parts[0]
+                try:
+                    pid = int(parts[2])
+                except ValueError:
+                    continue
+
+                cmdline_path = Path(f"/proc/{pid}/cmdline")
+                if cmdline_path.exists():
+                    try:
+                        cmdline = cmdline_path.read_bytes().decode("utf-8", errors="ignore").replace("\x00", " ")
+                        if "firefox" in cmdline:
+                            if "profiles/seat1" in cmdline:
+                                self.window_ids["seat1"] = win_id
+                                discovered["seat1"] = {"pid": pid, "window_id": win_id, "running": True}
+                            elif "profiles/seat2" in cmdline:
+                                self.window_ids["seat2"] = win_id
+                                discovered["seat2"] = {"pid": pid, "window_id": win_id, "running": True}
+                    except Exception:
+                        pass
+        return discovered
+
+    def is_any_kiosk_running(self) -> bool:
+        """Returns True if any kiosk instance is currently alive."""
+        with self._lock:
+            for p in self.running_processes.values():
+                if p.poll() is None:
+                    return True
+        # Check system discovery
+        discovered = self.discover_running_kiosks()
+        return len(discovered) > 0
+
     def get_status(self) -> Dict[str, Dict]:
         """Returns status dictionary of running kiosks."""
         with self._lock:
@@ -427,4 +488,8 @@ user_pref("app.update.enabled", false);
                     "window_id": self.window_ids.get(seat_id),
                     "url": self.kiosk_configs.get(seat_id, {}).get("kiosk_url", ""),
                 }
+            if not status or not any(s.get("running") for s in status.values()):
+                discovered = self.discover_running_kiosks()
+                if discovered:
+                    return discovered
             return status

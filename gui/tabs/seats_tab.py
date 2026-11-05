@@ -66,28 +66,48 @@ class SeatCard(Gtk.Frame):
         self.combo_kbd = Gtk.ComboBoxText()
         grid.attach(self.combo_kbd, 1, 2, 1, 1)
 
-        # Row 3: Firefox Profile
+        # Row 3: Peripheral Locking to Display
+        lbl_lock = Gtk.Label(label="Peripheral Lock:")
+        lbl_lock.set_halign(Gtk.Align.END)
+        grid.attach(lbl_lock, 0, 3, 1, 1)
+
+        lock_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=3)
+        grid.attach(lock_box, 1, 3, 1, 1)
+
+        self.chk_lock_peripherals = Gtk.CheckButton(label="🔒 Lock Peripherals to this Display (Auto-reseat on replug)")
+        self.chk_lock_peripherals.set_tooltip_text(
+            "When checked, this mouse and keyboard remain permanently bound to this display.\n"
+            "If unplugged and plugged back in (even into a different USB port), the setup auto-reseats."
+        )
+        self.chk_lock_peripherals.set_active(True)
+        lock_box.pack_start(self.chk_lock_peripherals, False, False, 0)
+
+        self.lbl_lock_status = Gtk.Label(label="")
+        self.lbl_lock_status.set_halign(Gtk.Align.START)
+        lock_box.pack_start(self.lbl_lock_status, False, False, 0)
+
+        # Row 4: Firefox Profile
         lbl_prof = Gtk.Label(label="Firefox Profile:")
         lbl_prof.set_halign(Gtk.Align.END)
-        grid.attach(lbl_prof, 0, 3, 1, 1)
+        grid.attach(lbl_prof, 0, 4, 1, 1)
 
         self.ent_profile = Gtk.Entry()
         self.ent_profile.set_text(self.seat_id)
-        grid.attach(self.ent_profile, 1, 3, 1, 1)
+        grid.attach(self.ent_profile, 1, 4, 1, 1)
 
-        # Row 4: Kiosk Homepage URL
+        # Row 5: Kiosk Homepage URL
         lbl_url = Gtk.Label(label="Kiosk Home URL:")
         lbl_url.set_halign(Gtk.Align.END)
-        grid.attach(lbl_url, 0, 4, 1, 1)
+        grid.attach(lbl_url, 0, 5, 1, 1)
 
         self.ent_url = Gtk.Entry()
         default_url = "https://duckduckgo.com" if is_primary else "https://www.google.com"
         self.ent_url.set_text(default_url)
-        grid.attach(self.ent_url, 1, 4, 1, 1)
+        grid.attach(self.ent_url, 1, 5, 1, 1)
 
-        # Row 5: Options
+        # Row 6: Options
         opts_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
-        grid.attach(opts_box, 1, 5, 1, 1)
+        grid.attach(opts_box, 1, 6, 1, 1)
 
         self.chk_lock = Gtk.CheckButton(label="Lock Kiosk Mode (Non-minimizable / Non-closable)")
         self.chk_lock.set_active(True)
@@ -110,29 +130,68 @@ class SeatCard(Gtk.Frame):
         if displays:
             self.combo_disp.set_active(active_disp_idx)
 
-        # 2. Mice
+        # 2. Mice (match by locked peripheral name first, then ID)
         self.combo_mouse.remove_all()
         selected_mouse_id = current_cfg.get("mouse_id")
+        selected_mouse_name = current_cfg.get("mouse_name", "")
         active_mouse_idx = 0
+        mouse_found = False
+
         for idx, p in enumerate(pointers):
             self.combo_mouse.append_text(f"[ID {p['id']}] {p['name']}")
-            if p['id'] == selected_mouse_id:
+            if selected_mouse_name and p['name'].strip().lower() == selected_mouse_name.strip().lower():
                 active_mouse_idx = idx
-        if pointers:
+                mouse_found = True
+            elif not mouse_found and p['id'] == selected_mouse_id:
+                active_mouse_idx = idx
+                mouse_found = True
+
+        if not mouse_found and selected_mouse_name:
+            # Device is unplugged, but memory is retained
+            self.combo_mouse.append_text(f"⚠️ [Unplugged] {selected_mouse_name} (Locked)")
+            active_mouse_idx = len(pointers)
+
+        if pointers or selected_mouse_name:
             self.combo_mouse.set_active(active_mouse_idx)
 
-        # 3. Keyboards
+        # 3. Keyboards (match by locked peripheral name first, then ID)
         self.combo_kbd.remove_all()
         selected_kbd_id = current_cfg.get("keyboard_id")
+        selected_kbd_name = current_cfg.get("keyboard_name", "")
         active_kbd_idx = 0
+        kbd_found = False
+
         for idx, k in enumerate(keyboards):
             self.combo_kbd.append_text(f"[ID {k['id']}] {k['name']}")
-            if k['id'] == selected_kbd_id:
+            if selected_kbd_name and k['name'].strip().lower() == selected_kbd_name.strip().lower():
                 active_kbd_idx = idx
-        if keyboards:
+                kbd_found = True
+            elif not kbd_found and k['id'] == selected_kbd_id:
+                active_kbd_idx = idx
+                kbd_found = True
+
+        if not kbd_found and selected_kbd_name:
+            # Device is unplugged, but memory is retained
+            self.combo_kbd.append_text(f"⚠️ [Unplugged] {selected_kbd_name} (Locked)")
+            active_kbd_idx = len(keyboards)
+
+        if keyboards or selected_kbd_name:
             self.combo_kbd.set_active(active_kbd_idx)
 
-        # 4. Text entries
+        # 4. Peripheral Lock state & status badge
+        is_locked = current_cfg.get("lock_peripherals", True)
+        self.chk_lock_peripherals.set_active(is_locked)
+        target_d = selected_disp or (displays[0]["name"] if displays else "Display")
+        if is_locked and (selected_mouse_name or selected_kbd_name):
+            m_icon = "🟢 Connected" if mouse_found else "🔴 Unplugged (retained)"
+            k_icon = "🟢 Connected" if kbd_found else "🔴 Unplugged (retained)"
+            self.lbl_lock_status.set_markup(
+                f"<span size='small' color='#2563eb'><b>🔒 Locked to {target_d}:</b> Mouse [{m_icon}] | Keyboard [{k_icon}]</span>"
+            )
+        else:
+            self.lbl_lock_status.set_markup("<span size='small' color='#6b7280'>Peripherals will follow default auto-detection.</span>")
+
+        # 5. Text entries
         if "profile_name" in current_cfg:
             self.ent_profile.set_text(current_cfg["profile_name"])
         if "kiosk_url" in current_cfg:
@@ -143,17 +202,38 @@ class SeatCard(Gtk.Frame):
             self.chk_respawn.set_active(current_cfg["auto_respawn"])
 
     def get_configured_data(self, displays, pointers, keyboards) -> dict:
-        """Extracts the user configuration from the widgets."""
+        """Extracts the user configuration from the widgets, retaining memory of locked peripherals."""
         disp_idx = self.combo_disp.get_active()
         disp_name = displays[disp_idx]["name"] if disp_idx >= 0 and disp_idx < len(displays) else ""
 
         mouse_idx = self.combo_mouse.get_active()
-        mouse_id = pointers[mouse_idx]["id"] if mouse_idx >= 0 and mouse_idx < len(pointers) else None
-        mouse_name = pointers[mouse_idx]["name"] if mouse_idx >= 0 and mouse_idx < len(pointers) else ""
+        if mouse_idx >= 0 and mouse_idx < len(pointers):
+            mouse_id = pointers[mouse_idx]["id"]
+            mouse_name = pointers[mouse_idx]["name"]
+        else:
+            # If currently unplugged placeholder was selected, retain the name from text
+            combo_txt = self.combo_mouse.get_active_text() or ""
+            if "⚠️ [Unplugged]" in combo_txt:
+                mouse_name = combo_txt.replace("⚠️ [Unplugged]", "").replace("(Locked)", "").strip()
+                mouse_id = None
+            else:
+                mouse_id = None
+                mouse_name = ""
 
         kbd_idx = self.combo_kbd.get_active()
-        kbd_id = keyboards[kbd_idx]["id"] if kbd_idx >= 0 and kbd_idx < len(keyboards) else None
-        kbd_name = keyboards[kbd_idx]["name"] if kbd_idx >= 0 and kbd_idx < len(keyboards) else ""
+        if kbd_idx >= 0 and kbd_idx < len(keyboards):
+            kbd_id = keyboards[kbd_idx]["id"]
+            kbd_name = keyboards[kbd_idx]["name"]
+        else:
+            combo_txt = self.combo_kbd.get_active_text() or ""
+            if "⚠️ [Unplugged]" in combo_txt:
+                kbd_name = combo_txt.replace("⚠️ [Unplugged]", "").replace("(Locked)", "").strip()
+                kbd_id = None
+            else:
+                kbd_id = None
+                kbd_name = ""
+
+        lock_periph = self.chk_lock_peripherals.get_active()
 
         return {
             "id": self.seat_id,
@@ -164,6 +244,8 @@ class SeatCard(Gtk.Frame):
             "mouse_name": mouse_name,
             "keyboard_id": kbd_id,
             "keyboard_name": kbd_name,
+            "lock_peripherals": lock_periph,
+            "locked_display": disp_name if lock_periph else None,
             "profile_name": self.ent_profile.get_text().strip() or self.seat_id,
             "kiosk_url": self.ent_url.get_text().strip() or "https://duckduckgo.com",
             "lock_kiosk": self.chk_lock.get_active(),
@@ -271,6 +353,11 @@ class SeatsTab(Gtk.Box):
         if ok:
             self.app.show_info("Configuration saved successfully ✓", 0)
             self.app.dashboard_tab.append_log("Configuration saved to ~/.config/xinput-seats/config.json")
+            if s1_data.get("lock_peripherals"):
+                self.app.dashboard_tab.append_log(f"🔒 Locked Seat 1 peripherals to '{s1_data['display']}': Mouse '{s1_data.get('mouse_name')}', Kbd '{s1_data.get('keyboard_name')}'")
+            if s2_data.get("lock_peripherals"):
+                self.app.dashboard_tab.append_log(f"🔒 Locked Seat 2 peripherals to '{s2_data['display']}': Mouse '{s2_data.get('mouse_name')}', Kbd '{s2_data.get('keyboard_name')}'")
+            self.refresh()
             self.app.dashboard_tab.refresh_metrics()
         else:
             self.app.show_info("Failed to save configuration!", 1)

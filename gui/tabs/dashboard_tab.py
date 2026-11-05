@@ -90,6 +90,7 @@ class DashboardTab(Gtk.Box):
 
         # Log initial event
         self.append_log("System initialized. Ready.")
+        self.append_log("Shortcut: Press Ctrl+Shift+M+S in kiosk mode to overlay control panel on your screen.")
 
         # Auto-refresh loop
         self.refresh_metrics()
@@ -211,6 +212,8 @@ class DashboardTab(Gtk.Box):
             self.append_log("Applying XInput MPX master pairs & device reattachments...")
             results = self.app.seating_engine.apply_seating(seats, displays, (total_screen["width"], total_screen["height"]))
             self.append_log(f"XInput mapping results: {results}")
+            if hasattr(self.app, 'hotkey_mgr') and self.app.hotkey_mgr:
+                self.app.hotkey_mgr.update_seat_keyboards(self.app.seating_engine.seat_keyboards)
 
             # 2. Launch Firefox kiosks
             self.append_log("Launching dual Firefox kiosks with isolated profiles...")
@@ -226,7 +229,8 @@ class DashboardTab(Gtk.Box):
 
             if ok:
                 self.append_log("Dual Firefox kiosks launched successfully in kiosk mode.")
-                GLib.idle_add(self.app.show_info, "Pseudo-seating active! Dual Firefox kiosks running.", 0)
+                self.append_log("⚡ Super Shortcut active: Press Ctrl + Shift + M + S on any seat to overlay control panel on your screen.")
+                GLib.idle_add(self.app.show_info, "Pseudo-seating active! Dual Firefox kiosks running (Ctrl+Shift+M+S to overlay).", 0)
             else:
                 self.append_log("Warning: One or more Firefox kiosks failed to launch.")
                 GLib.idle_add(self.app.show_info, "Check logs: Firefox launch issue.", 1)

@@ -1,19 +1,23 @@
 """
 Main Application Window for XInput Pseudo-Seating Control Panel.
 GTK3 Application Window with HeaderBar, InfoBar, Status Cards, and Modular Tabs.
+Supports Super Keyboard Shortcut (Ctrl+Shift+M+S) overlay on top of kiosk mode.
 """
 
 import gi
 gi.require_version('Gtk', '3.0')
-from gi.repository import Gtk, Gdk, GLib
+from gi.repository import Gtk, Gdk, GLib, GdkX11
 
 import logging
+import subprocess
 from pathlib import Path
+from typing import Optional
 
 from core.device_manager import DeviceManager
 from core.xinput_seating import XInputSeatingEngine
 from core.kiosk_manager import KioskManager
 from core.config_manager import ConfigManager
+from core.hotkey_manager import HotkeyManager, OverlayIPCServer, get_seat_screen_geometry
 from gui.styles import CSS_STYLES
 from gui.tabs import DashboardTab, SeatsTab, DevicesTab, TestTab, ConfigTab
 
@@ -21,18 +25,27 @@ logger = logging.getLogger("xinput_seating.app")
 
 
 class XInputMultiseatApp(Gtk.ApplicationWindow):
-    """Main window for XInput Pseudo-Seating Control Panel."""
+    """Main window for XInput Pseudo-Seating Control Panel with overlay mode support."""
 
-    def __init__(self):
+    def __init__(self, overlay_mode: bool = False, target_seat: str = "seat1"):
         super().__init__(title="XInput Pseudo-Seating Control Panel")
         self.set_default_size(960, 680)
         self.set_position(Gtk.WindowPosition.CENTER)
+
+        # ── Overlay State ─────────────────────────────────────────────────
+        self.is_overlay_active: bool = False
+        self.active_overlay_seat: Optional[str] = None
+        self._overlay_mode_standalone: bool = overlay_mode
 
         # ── Initialize Core Engines ───────────────────────────────────────
         self.device_mgr = DeviceManager()
         self.seating_engine = XInputSeatingEngine()
         self.kiosk_mgr = KioskManager()
         self.config_mgr = ConfigManager()
+        self.kiosk_mgr.on_window_ready = self.seating_engine.focus_seat_keyboard
+
+        # Discover already running kiosks (if any)
+        self.kiosk_mgr.discover_running_kiosks()
 
         # ── Apply CSS Styles ──────────────────────────────────────────────
         css_provider = Gtk.CssProvider()
@@ -58,6 +71,18 @@ class XInputMultiseatApp(Gtk.ApplicationWindow):
         btn_header_refresh.set_tooltip_text("Refresh All Status & Devices")
         btn_header_refresh.connect("clicked", lambda _: self.refresh_all())
         hb.pack_end(btn_header_refresh)
+
+        # Overlay Controls in HeaderBar
+        self.btn_hide_overlay = Gtk.Button(label="⬇  Hide Overlay")
+        self.btn_hide_overlay.set_tooltip_text("Hide control board and return to kiosk mode (or press Ctrl+Shift+M+S or Esc)")
+        self.btn_hide_overlay.get_style_context().add_class("btn-danger")
+        self.btn_hide_overlay.connect("clicked", lambda _: self.hide_overlay())
+        self.btn_hide_overlay.set_no_show_all(True)
+        hb.pack_end(self.btn_hide_overlay)
+
+        self.lbl_overlay_badge = Gtk.Label(label="")
+        self.lbl_overlay_badge.set_no_show_all(True)
+        hb.pack_end(self.lbl_overlay_badge)
 
         # ── Root Layout & InfoBar ─────────────────────────────────────────
         root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
@@ -98,12 +123,230 @@ class XInputMultiseatApp(Gtk.ApplicationWindow):
         self.config_tab = ConfigTab(self)
         self.notebook.append_page(self.config_tab, Gtk.Label(label="⚙  Config & Profiles"))
 
-        # Connect cleanup on destroy
+        # ── Global Hotkey & IPC Services ──────────────────────────────────
+        self.hotkey_mgr = HotkeyManager(
+            on_trigger=self._on_hotkey_triggered,
+            on_device_changed=self._on_xinput_hierarchy_changed,
+        )
+        self.hotkey_mgr.update_seat_keyboards(self.seating_engine.seat_keyboards)
+        self.hotkey_mgr.start()
+
+        self.ipc_server = OverlayIPCServer(on_command=self._on_ipc_command)
+        self.ipc_server.start()
+
+        # Periodic hotplug reseating check for locked peripherals
+        GLib.timeout_add_seconds(3, self._periodic_hotplug_check)
+
+        # Connect window events
         self.connect("destroy", self._on_window_destroy)
+        self.connect("delete-event", self._on_delete_event)
+        self.connect("key-press-event", self._on_key_press)
 
         # First run check
         if not self.config_mgr.config_path.exists():
             GLib.idle_add(self._show_setup_wizard)
+
+        # If launched directly in overlay mode
+        if overlay_mode:
+            GLib.idle_add(self.show_overlay, target_seat)
+
+    # -----------------------------------------------------------------------
+    # Global Hotkey & Overlay IPC Handlers
+    # -----------------------------------------------------------------------
+    def _on_ipc_command(self, cmd_line: str):
+        """Dispatches commands arriving via Unix domain socket."""
+        parts = cmd_line.strip().split()
+        if not parts:
+            return
+        cmd = parts[0].upper()
+        seat_id = parts[1] if len(parts) > 1 else "seat1"
+
+        if cmd == "SHOW":
+            GLib.idle_add(self.show_overlay, seat_id)
+        elif cmd == "HIDE":
+            GLib.idle_add(self.hide_overlay)
+        elif cmd == "TOGGLE":
+            GLib.idle_add(self.toggle_overlay, seat_id)
+
+    def _on_hotkey_triggered(self, seat_id: str, _master_id: int, _slave_id: int):
+        """Callback from background XInput2 listener when Ctrl+Shift+M+S is hit."""
+        logger.info(f"Hotkey Ctrl+Shift+M+S detected on seat '{seat_id}'! Toggling overlay...")
+        GLib.idle_add(self.toggle_overlay, seat_id)
+
+    def _on_xinput_hierarchy_changed(self):
+        """Called when an XInput device is plugged in, unplugged, or changed."""
+        GLib.idle_add(self._handle_hotplug_recheck)
+
+    def _periodic_hotplug_check(self):
+        """Heartbeat to ensure replugged peripherals are verified and reseated."""
+        self._handle_hotplug_recheck()
+        return True
+
+    def _handle_hotplug_recheck(self):
+        """Verifies locked peripherals and auto-reseats them if replugged into new ports."""
+        try:
+            cfg = self.config_mgr.load_config()
+            seats = cfg.get("seats", [])
+            if self.seating_engine.seat_keyboards:
+                reseated = self.seating_engine.check_and_reseat_hotplugged_devices(seats)
+                if reseated:
+                    for msg in reseated:
+                        logger.info(f"[Hotplug Reseat] {msg}")
+                        self.dashboard_tab.append_log(f"⚡ {msg}")
+                    self.show_info(f"Peripheral reconnected and reseated ✓ ({len(reseated)} device(s))", 0)
+                    self.seats_tab.refresh()
+                    self.dashboard_tab.refresh_metrics()
+        except Exception as exc:
+            logger.debug(f"Hotplug check notice: {exc}")
+        return False
+
+    def _on_key_press(self, _widget, event):
+        """Keyboard shortcut handler inside the GUI window."""
+        if event.keyval == Gdk.KEY_Escape and self.is_overlay_active:
+            self.hide_overlay()
+            return True
+        return False
+
+    def _on_delete_event(self, _widget, _event):
+        """
+        When kiosks are active, clicking the close button 'X' hides the overlay
+        back into kiosk mode rather than killing the entire application.
+        """
+        if self.kiosk_mgr.is_any_kiosk_running():
+            logger.info("Close button clicked while kiosks active. Hiding overlay.")
+            self.hide_overlay()
+            return True  # Prevent window destruction
+        return False  # Allow clean shutdown
+
+    # -----------------------------------------------------------------------
+    # Overlay Mode Presentation & Seat Focus
+    # -----------------------------------------------------------------------
+    def show_overlay(self, seat_id: str = "seat1"):
+        """
+        Overlays the Control Board GUI on top of kiosk mode on the monitor
+        assigned to the user/seat that triggered it.
+        """
+        logger.info(f"Presenting Control Board overlay for seat '{seat_id}'...")
+        self.is_overlay_active = True
+        self.active_overlay_seat = seat_id
+
+        # Update hotkey master map if seating is active
+        if self.seating_engine.seat_keyboards:
+            self.hotkey_mgr.update_seat_keyboards(self.seating_engine.seat_keyboards)
+
+        # Notify kiosk supervisor watchdog not to steal focus
+        self.kiosk_mgr.set_overlay_seat(seat_id)
+        self.kiosk_mgr.set_kiosk_above(seat_id, False)
+
+        # Resolve target display geometry
+        cfg = self.config_mgr.load_config()
+        seats = cfg.get("seats", [])
+        displays, _ = self.device_mgr.get_displays()
+        x, y, w, h, d_name = get_seat_screen_geometry(seat_id, seats, displays)
+
+        # Calculate centered position and dimensions fitting the screen
+        win_w = min(960, max(600, w - 40))
+        win_h = min(680, max(450, h - 50))
+        pos_x = x + (w - win_w) // 2
+        pos_y = y + (h - win_h) // 2
+
+        self.set_keep_above(True)
+        self.resize(win_w, win_h)
+        self.move(pos_x, pos_y)
+        self.deiconify()
+        self.present()
+        self.show_all()
+
+        # Update overlay badge in headerbar
+        self.btn_hide_overlay.show()
+        badge_text = f"  🖥 {seat_id.upper()} OVERLAY ({d_name})  "
+        self.lbl_overlay_badge.set_markup(
+            f"<span background='#1e3a8a' color='#f8fafc' weight='bold' font_family='sans'>{badge_text}</span>"
+        )
+        self.lbl_overlay_badge.show()
+
+        # Apply wmctrl hints and seat focus binding
+        GLib.idle_add(self._apply_overlay_wm_and_focus, seat_id, pos_x, pos_y, win_w, win_h)
+
+    def _apply_overlay_wm_and_focus(self, seat_id: str, pos_x: int, pos_y: int, win_w: int, win_h: int):
+        """Sets X11 window hints and binds the seat's master pointer/keyboard."""
+        gdk_win = self.get_window()
+        if not gdk_win:
+            return False
+
+        try:
+            xid = gdk_win.get_xid()
+            xid_hex = hex(xid)
+
+            # Ensure window manager places this window in the above layer and raises it
+            subprocess.run(["wmctrl", "-i", "-r", xid_hex, "-b", "add,above"], capture_output=True)
+            subprocess.run(["wmctrl", "-i", "-r", xid_hex, "-e", f"0,{pos_x},{pos_y},{win_w},{win_h}"], capture_output=True)
+            subprocess.run(["wmctrl", "-i", "-a", xid_hex], capture_output=True)
+
+            # Bind seat's master pointer and keyboard to the control board window
+            ptr_id = self.seating_engine.seat_pointers.get(seat_id)
+            kbd_id = self.seating_engine.seat_keyboards.get(seat_id)
+            if ptr_id:
+                self.seating_engine.confiner.set_client_pointer(xid_hex, ptr_id)
+            if kbd_id:
+                self.seating_engine.confiner.set_focus(kbd_id, xid_hex)
+        except Exception as exc:
+            logger.warning(f"Error applying overlay WM hints: {exc}")
+
+        self.show_info(
+            f"⚡ Control Board overlay active on {seat_id.upper()}. Press Ctrl+Shift+M+S or Esc to return to Kiosk.",
+            0,
+        )
+        return False
+
+    def hide_overlay(self):
+        """Hides or lowers the Control Board overlay and restores full kiosk focus."""
+        if not self.is_overlay_active and not self.get_visible():
+            return
+
+        prev_seat = self.active_overlay_seat
+        logger.info(f"Dismissing Control Board overlay (was active on '{prev_seat}').")
+        self.is_overlay_active = False
+        self.active_overlay_seat = None
+
+        self.btn_hide_overlay.hide()
+        self.lbl_overlay_badge.hide()
+        self.set_keep_above(False)
+
+        # Notify kiosk supervisor watchdog overlay is closed
+        self.kiosk_mgr.set_overlay_seat(None)
+
+        if prev_seat:
+            # Restore 'above' on that seat's kiosk
+            self.kiosk_mgr.set_kiosk_above(prev_seat, True)
+
+            # Re-bind that seat's keyboard and pointer to its kiosk window
+            win_id = self.kiosk_mgr.window_ids.get(prev_seat)
+            if not win_id:
+                self.kiosk_mgr.discover_running_kiosks()
+                win_id = self.kiosk_mgr.window_ids.get(prev_seat)
+
+            kbd_id = self.seating_engine.seat_keyboards.get(prev_seat)
+            ptr_id = self.seating_engine.seat_pointers.get(prev_seat)
+            if win_id:
+                if ptr_id:
+                    self.seating_engine.confiner.set_client_pointer(win_id, ptr_id)
+                if kbd_id:
+                    self.seating_engine.confiner.set_focus(kbd_id, win_id)
+
+        # Hide or iconify window
+        if self._overlay_mode_standalone:
+            self.hide()
+        else:
+            self.iconify()
+
+    def toggle_overlay(self, seat_id: str = "seat1"):
+        """Toggles overlay visibility on the designated seat."""
+        if self.is_overlay_active and self.get_visible() and self.active_overlay_seat == seat_id:
+            self.hide_overlay()
+        else:
+            self.show_overlay(seat_id)
+
     # -----------------------------------------------------------------------
     # InfoBar Notification Helper
     # -----------------------------------------------------------------------
@@ -168,7 +411,11 @@ class XInputMultiseatApp(Gtk.ApplicationWindow):
     # Clean Shutdown
     # -----------------------------------------------------------------------
     def _on_window_destroy(self, _widget):
-        logger.info("Window closing. Stopping kiosk watchdog...")
+        logger.info("Window closing. Stopping kiosk watchdog and overlay services...")
+        if hasattr(self, 'hotkey_mgr') and self.hotkey_mgr:
+            self.hotkey_mgr.stop()
+        if hasattr(self, 'ipc_server') and self.ipc_server:
+            self.ipc_server.stop()
         self.kiosk_mgr.stop_watchdog()
-        Gtk.main_quit()
-  
+        if Gtk.main_level() > 0:
+            Gtk.main_quit()

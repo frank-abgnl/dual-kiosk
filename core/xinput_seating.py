@@ -326,10 +326,19 @@ class XInputSeatingEngine:
     ) -> Dict[str, bool]:
         """
         Applies a multi-seat configuration:
+        - Resolves live IDs for locked peripheral names so devices replugged into different ports are properly mapped.
         - Seat 1 is assigned to Virtual core pointer (2) & keyboard (3).
         - Seat 2 creates/uses a master pair and attaches assigned devices.
         - Each seat's master pointer is confined to its monitor with pointer barriers.
         """
+        # Resolve live IDs for locked peripheral names across USB ports
+        from core.device_manager import DeviceManager
+        dm = DeviceManager()
+        resolved_seats, resolve_msgs = dm.resolve_seat_devices(seats_config, preserve_memory=True)
+        for msg in resolve_msgs:
+            logger.info(f"[Seat Resolver] {msg}")
+        seats_config = resolved_seats
+
         results = {}
         disp_map = {d["name"]: d for d in displays_info} if displays_info else {}
 
@@ -381,3 +390,90 @@ class XInputSeatingEngine:
                 results[f"{seat_id}_confined"] = False
 
         return results
+
+    def check_and_reseat_hotplugged_devices(
+        self,
+        seats_config: List[Dict],
+        displays_info: Optional[List[Dict]] = None,
+        total_screen: Optional[Tuple[int, int]] = None,
+    ) -> List[str]:
+        """
+        Scans connected hardware against locked peripheral names for each seat.
+        If a peripheral was unplugged and replugged (even into a different port,
+        gaining a new XInput ID, or getting attached back to Virtual core by Xorg),
+        it dynamically reattaches it to its locked master, re-confines pointer,
+        copies layout, and re-focuses its kiosk window.
+        Returns a list of human-readable log messages describing actions taken.
+        """
+        if not self.seat_keyboards and not self.seat_pointers:
+            return []  # Seating is not active
+
+        from core.device_manager import DeviceManager
+        dm = DeviceManager()
+        if displays_info is None:
+            displays_info, total = dm.get_displays()
+            if total_screen is None and total:
+                total_screen = (total.get("width", 1920), total.get("height", 1080))
+
+        disp_map = {d["name"]: d for d in displays_info} if displays_info else {}
+        resolved_seats, _ = dm.resolve_seat_devices(seats_config, preserve_memory=True)
+        masters, ptr_slaves, kbd_slaves = dm.get_xinput_hierarchy()
+
+        current_ptr_att = {p["id"]: p.get("attachment") for p in ptr_slaves}
+        current_kbd_att = {k["id"]: k.get("attachment") for k in kbd_slaves}
+
+        reseated_messages = []
+
+        for seat in resolved_seats:
+            seat_id = seat.get("id", "seat1")
+            is_primary = seat.get("is_primary", False)
+            disp_name = seat.get("display")
+
+            target_ptr_master = self.seat_pointers.get(seat_id, self.CORE_POINTER_ID if is_primary else None)
+            target_kbd_master = self.seat_keyboards.get(seat_id, self.CORE_KEYBOARD_ID if is_primary else None)
+
+            # 1. Mouse check
+            mouse_id = seat.get("mouse_id")
+            mouse_name = seat.get("mouse_name")
+            if mouse_id and target_ptr_master:
+                curr_att = current_ptr_att.get(mouse_id)
+                if curr_att != target_ptr_master:
+                    logger.info(
+                        f"Re-attaching replugged mouse '{mouse_name}' (ID {mouse_id}) to seat '{seat_id}' master {target_ptr_master}..."
+                    )
+                    self.attach_with_siblings(mouse_id, target_ptr_master, "pointer")
+                    if disp_name:
+                        self.map_pointer_to_output(mouse_id, disp_name)
+
+                    if not is_primary and isinstance(target_ptr_master, int) and disp_name in disp_map:
+                        d = disp_map[disp_name]
+                        if d.get("width") and d.get("height"):
+                            geom = (d["width"], d["height"], d["x"], d["y"])
+                            self.confine_master(target_ptr_master, geom, total_screen)
+
+                    reseated_messages.append(
+                        f"Mouse '{mouse_name}' (ID {mouse_id}) replugged -> auto-reseated to Seat '{seat_id}' (Display: {disp_name})"
+                    )
+
+            # 2. Keyboard check
+            kbd_id = seat.get("keyboard_id")
+            kbd_name = seat.get("keyboard_name")
+            if kbd_id and target_kbd_master:
+                curr_att = current_kbd_att.get(kbd_id)
+                if curr_att != target_kbd_master:
+                    logger.info(
+                        f"Re-attaching replugged keyboard '{kbd_name}' (ID {kbd_id}) to seat '{seat_id}' master {target_kbd_master}..."
+                    )
+                    self.attach_with_siblings(kbd_id, target_kbd_master, "keyboard")
+                    if not is_primary and isinstance(target_kbd_master, int):
+                        self.copy_keyboard_layout(target_kbd_master)
+
+                    win_id = self.seat_windows.get(seat_id)
+                    if win_id and isinstance(target_kbd_master, int):
+                        self.confiner.set_focus(target_kbd_master, win_id)
+
+                    reseated_messages.append(
+                        f"Keyboard '{kbd_name}' (ID {kbd_id}) replugged -> auto-reseated to Seat '{seat_id}' (Display: {disp_name})"
+                    )
+
+        return reseated_messages

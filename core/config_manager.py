@@ -37,6 +37,8 @@ class ConfigManager:
                     "mouse_name": "",
                     "keyboard_id": None,
                     "keyboard_name": "",
+                    "lock_peripherals": True,
+                    "locked_display": "eDP-1",
                     "profile_name": "seat1",
                     "kiosk_url": "https://duckduckgo.com",
                     "lock_kiosk": True,
@@ -51,6 +53,8 @@ class ConfigManager:
                     "mouse_name": "",
                     "keyboard_id": None,
                     "keyboard_name": "",
+                    "lock_peripherals": True,
+                    "locked_display": "HDMI-1",
                     "profile_name": "seat2",
                     "kiosk_url": "https://www.google.com",
                     "lock_kiosk": True,
@@ -61,6 +65,8 @@ class ConfigManager:
                 "auto_start_kiosks": True,
                 "confine_mouse_to_screen": True,
                 "watchdog_interval_sec": 1.5,
+                "lock_peripherals_to_displays": True,
+                "hotplug_auto_reseat": True,
             },
         }
 
@@ -91,14 +97,18 @@ class ConfigManager:
             logger.error(f"Failed to save config to {self.config_path}: {exc}")
             return False
 
-    def auto_generate_config(self, device_manager) -> Dict:
+    def auto_generate_config(self, device_manager, force_reassign: bool = False) -> Dict:
         """
         Auto-populates configuration from current connected hardware,
         identifying screen resolutions and connected USB input devices.
         Preserves custom URLs and kiosk preferences if config already exists.
+        Retains memory of locked peripheral names to displays across replugs and reboots.
         """
-        auto_map = device_manager.auto_detect_seat_assignments()
-        cfg = self.load_config() if self.config_path.exists() else self.get_default_config()
+        existing_cfg = self.load_config() if self.config_path.exists() else {}
+        existing_seats = existing_cfg.get("seats") if not force_reassign else None
+
+        auto_map = device_manager.auto_detect_seat_assignments(existing_seats=existing_seats)
+        cfg = existing_cfg if existing_cfg.get("seats") else self.get_default_config()
         if not cfg.get("seats") or len(cfg.get("seats", [])) < 2:
             cfg = self.get_default_config()
 
@@ -110,6 +120,8 @@ class ConfigManager:
         cfg["seats"][0]["mouse_name"] = s1.get("mouse_name", "")
         cfg["seats"][0]["keyboard_id"] = s1.get("keyboard_id")
         cfg["seats"][0]["keyboard_name"] = s1.get("keyboard_name", "")
+        cfg["seats"][0]["lock_peripherals"] = s1.get("lock_peripherals", True)
+        cfg["seats"][0]["locked_display"] = s1.get("locked_display", cfg["seats"][0]["display"])
 
         # Update Seat 2
         s2 = auto_map.get("seat2", {})
@@ -119,6 +131,8 @@ class ConfigManager:
         cfg["seats"][1]["mouse_name"] = s2.get("mouse_name", "")
         cfg["seats"][1]["keyboard_id"] = s2.get("keyboard_id")
         cfg["seats"][1]["keyboard_name"] = s2.get("keyboard_name", "")
+        cfg["seats"][1]["lock_peripherals"] = s2.get("lock_peripherals", True)
+        cfg["seats"][1]["locked_display"] = s2.get("locked_display", cfg["seats"][1]["display"])
 
         self.save_config(cfg)
         return cfg

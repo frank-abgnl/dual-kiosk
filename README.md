@@ -55,6 +55,14 @@ flowchart TD
 
 ## Key Features
 
+- **Super Keyboard Shortcut (`Ctrl + Shift + M + S`) Overlay:**
+  - Pressing **`Ctrl + Shift + M + S`** in kiosk mode instantly overlays the Control Board GUI on top of the fullscreen locked browser on the screen of the user who triggered it.
+  - Uses XInput 2 passive raw event interception to detect the hotkey without grab conflicts or blocking application keystrokes.
+  - Automatically correlates the triggering keyboard device to its seat and moves/centers the GUI onto that seat's physical screen.
+  - Sets `_NET_WM_STATE_ABOVE` and binds the user's seat keyboard and pointer focus directly to the Control Board.
+  - Pauses kiosk supervisor watchdog focus reclaiming for that seat while the overlay is visible.
+  - Pressing **`Ctrl + Shift + M + S`** again, pressing **`Esc`**, or clicking **`⬇ Hide Overlay`** dismisses the overlay and immediately restores the seat's keyboard focus to the kiosk.
+  - Works whether the GUI was already running or running in headless/autostart mode (auto-launches the GUI if needed).
 - **Power Outage Recovery & Launch on Startup:**
   - One-click toggle in the GUI dashboard: **`⚡ Launch on Startup`**.
   - CLI flags to enable (`--enable-autostart`), disable (`--disable-autostart`), or toggle (`--toggle-autostart`).
@@ -105,6 +113,7 @@ dual-kiosk/
 │   ├── pointer_barriers.py     # XFixes pointer boundary confinement
 │   ├── xinput_seating.py       # MPX master pair creation, reattachment & confinement
 │   ├── kiosk_manager.py        # Firefox profile generator, kiosk launcher & watchdog
+│   ├── hotkey_manager.py       # Super shortcut (Ctrl+Shift+M+S) listener & overlay IPC
 │   ├── config_manager.py       # JSON configuration manager (~/.config/xinput-seats/)
 │   └── uninstaller.py          # Complete teardown and system restore logic
 └── gui/
@@ -166,6 +175,8 @@ The application can be driven entirely from the command line (e.g. for systemd s
 | `./start.sh --start` | Apply seating mappings and launch kiosks with supervisor |
 | `./start.sh --stop` | Terminate all kiosks and reset XInput devices to core |
 | `./start.sh --reset-devices` | Reset XInput devices to core without touching kiosks |
+| `./start.sh --overlay` | Launch or show Control Board GUI in overlay mode on top of kiosk mode |
+| `./start.sh --toggle-overlay --seat seat2` | Toggle Control Board GUI overlay on a specific seat via IPC or launch |
 | `./start.sh --uninstall` | Fully restore system to pre-setup state (removes masters, configs, profiles) |
 
 ---

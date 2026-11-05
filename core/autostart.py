@@ -252,11 +252,20 @@ def run_startup_reseat_and_launch(wait_timeout_sec: int = 20) -> bool:
 
     if ok:
         logger.info("Dual kiosks launched successfully on startup!")
+        from core.hotkey_manager import HotkeyManager
+        hotkey_mgr = HotkeyManager(launch_gui_if_needed=True, seat_keyboards=engine.seat_keyboards)
+        hotkey_mgr.start()
+        logger.info("Super Keyboard Shortcut (Ctrl+Shift+M+S) listener active for kiosk overlay.")
         try:
             while True:
                 time.sleep(2)
+                reseated = engine.check_and_reseat_hotplugged_devices(seats, displays, (total["width"], total["height"]))
+                if reseated:
+                    for m in reseated:
+                        logger.info(f"[Autostart Hotplug Reseat] {m}")
         except (KeyboardInterrupt, SystemExit):
-            logger.info("Stopping kiosks and resetting seating...")
+            logger.info("Stopping kiosks, hotkey listener and resetting seating...")
+            hotkey_mgr.stop()
             kiosk_mgr.stop_all_kiosks()
             engine.reset_all_to_core()
     else:

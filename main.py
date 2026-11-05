@@ -179,13 +179,22 @@ def run_cli(args):
         ok = kiosk_mgr.launch_dual_kiosks(s1_url, s2_url, displays, enforce_lock=True)
         if ok:
             print("[✓] Dual Firefox kiosks launched successfully!")
+            from core.hotkey_manager import HotkeyManager
+            hotkey_mgr = HotkeyManager(launch_gui_if_needed=True, seat_keyboards=engine.seat_keyboards)
+            hotkey_mgr.start()
+            print("    ⚡ Super Shortcut: Press Ctrl+Shift+M+S on any seat to overlay the control board.")
             print("    Press Ctrl+C to stop kiosks and reset seating.")
             try:
                 import time
                 while True:
-                    time.sleep(1)
+                    time.sleep(2)
+                    reseated = engine.check_and_reseat_hotplugged_devices(seats, displays, (total["width"], total["height"]))
+                    if reseated:
+                        for m in reseated:
+                            print(f"[✓] Hotplug: {m}")
             except KeyboardInterrupt:
-                print("\n[*] Stopping kiosks and resetting devices...")
+                print("\n[*] Stopping kiosks, hotkey listener and resetting devices...")
+                hotkey_mgr.stop()
                 kiosk_mgr.stop_all_kiosks()
                 engine.reset_all_to_core()
                 print("[✓] Cleanup complete.")
@@ -209,6 +218,9 @@ def main():
     parser.add_argument("--enable-autostart", "--install-service", action="store_true", help="Enable automatic launch on startup")
     parser.add_argument("--disable-autostart", action="store_true", help="Disable automatic launch on startup")
     parser.add_argument("--toggle-autostart", action="store_true", help="Toggle automatic launch on startup")
+    parser.add_argument("--overlay", action="store_true", help="Launch Control Board GUI in overlay mode on top of kiosk mode")
+    parser.add_argument("--seat", default="seat1", help="Target seat for overlay mode (default: seat1)")
+    parser.add_argument("--toggle-overlay", action="store_true", help="Toggle Control Board overlay on target seat via IPC or launch")
     parser.add_argument("--uninstall", action="store_true",
                         help="Terminate everything, reset XInput, and remove configs/profiles/launchers")
     parser.add_argument("--yes", "-y", action="store_true", help="Skip the confirmation prompt (with --uninstall)")
@@ -222,6 +234,22 @@ def main():
     if args.uninstall:
         run_uninstall(args)
         return
+
+    # If overlay or toggle-overlay requested, try IPC first
+    if args.toggle_overlay:
+        from core.hotkey_manager import send_overlay_command
+        target = args.seat or "seat1"
+        if send_overlay_command(f"TOGGLE {target}"):
+            print(f"[✓] Sent TOGGLE overlay command to active Control Board GUI for '{target}'.")
+            return
+        args.overlay = True
+
+    if args.overlay:
+        from core.hotkey_manager import send_overlay_command
+        target = args.seat or "seat1"
+        if send_overlay_command(f"SHOW {target}"):
+            print(f"[✓] Sent SHOW overlay command to active Control Board GUI for '{target}'.")
+            return
 
     # If any CLI action flag is given, run CLI
     if (args.start or args.stop or args.status or args.auto or
@@ -237,7 +265,7 @@ def main():
         from gi.repository import Gtk
         from gui.app import XInputMultiseatApp
 
-        app = XInputMultiseatApp()
+        app = XInputMultiseatApp(overlay_mode=args.overlay, target_seat=args.seat or "seat1")
         app.show_all()
         Gtk.main()
     except Exception as exc:
