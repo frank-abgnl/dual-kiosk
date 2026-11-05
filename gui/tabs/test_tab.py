@@ -132,12 +132,18 @@ class TestTab(Gtk.Box):
         status = self.app.kiosk_mgr.get_status()
         rows = []
         for seat_id, info in status.items():
+            if info.get("running"):
+                state = "🟢 Running (Locked)"
+            elif info.get("sleeping"):
+                state = "😴 Sleeping (display disconnected)"
+            else:
+                state = "🔴 Stopped"
             rows.append([
                 seat_id.upper(),
-                str(info.get("pid") or "Stopped"),
+                str(info.get("pid") or ("—" if info.get("sleeping") else "Stopped")),
                 str(info.get("window_id") or "N/A"),
                 info.get("url") or "",
-                "🟢 Running (Locked)" if info.get("running") else "🔴 Stopped",
+                state,
             ])
         if not rows:
             rows.append(["(No kiosks active)", "—", "—", "—", "Offline"])

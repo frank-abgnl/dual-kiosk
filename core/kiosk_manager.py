@@ -7,12 +7,15 @@ Enforces non-minimizable, non-closable kiosk mode with an automated watchdog sup
 
 import subprocess
 import os
+import re
 import time
 import threading
 import logging
 import json
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
+
+from core import overlay_state
 
 logger = logging.getLogger("xinput_seating.kiosk")
 
@@ -48,6 +51,7 @@ class KioskManager:
         # keyboard master focus on its kiosk window.
         self.on_window_ready = None
         self.overlay_seat: Optional[str] = None
+        self._demoted_fs: Dict[str, bool] = {}  # seat -> True if we removed fullscreen for the overlay
 
         PROFILES_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -253,7 +257,13 @@ user_pref("app.update.enabled", false);
             self.lock_window(win_id)
         self._notify_window(seat_id, win_id)
 
+    def _overlay_blocks(self, seat_id: str) -> bool:
+        """True while the Control Board is whitelisted on this seat (any process)."""
+        return self.overlay_seat == seat_id or overlay_state.is_active(seat_id)
+
     def _notify_window(self, seat_id: str, win_id: str):
+        if self._overlay_blocks(seat_id):
+            return  # never pin focus back to the kiosk while the overlay owns the seat
         cb = self.on_window_ready
         if cb:
             try:
@@ -318,7 +328,7 @@ user_pref("app.update.enabled", false);
         logger.info("Kiosk supervisor watchdog stopped.")
 
     def _watchdog_loop(self, interval_sec: float):
-        """Main monitoring loop: respawns killed instances and unminimizes hidden ones."""
+        """Respawns killed instances / unminimizes hidden ones, except on whitelisted (overlay) seats."""
         while not self._stop_watchdog.is_set():
             time.sleep(interval_sec)
 
@@ -328,6 +338,10 @@ user_pref("app.update.enabled", false);
             for seat_id in active_seats:
                 if self._stop_watchdog.is_set():
                     break
+
+                # Control Board is whitelisted: no respawn, no focus pinning, no restore.
+                if self._overlay_blocks(seat_id):
+                    continue
 
                 with self._lock:
                     proc = self.running_processes.get(seat_id)
@@ -346,8 +360,8 @@ user_pref("app.update.enabled", false);
                         )
                     continue
 
-                if win_id and (self.overlay_seat != seat_id):
-                    self._notify_window(seat_id, win_id)  # keep per-seat keyboard focus pinned unless overlay is showing
+                if win_id:
+                    self._notify_window(seat_id, win_id)
 
                 if win_id and cfg.get("enforce_lock", True):
                     out, _, rc = run_command(["xprop", "-id", win_id, "_NET_WM_STATE"])
@@ -416,21 +430,83 @@ user_pref("app.update.enabled", false);
             self.window_ids.clear()
         logger.info("All kiosk instances stopped.")
 
+    # -----------------------------------------------------------------------
+    # Overlay whitelist & priority handling
+    # -----------------------------------------------------------------------
     def set_overlay_seat(self, seat_id: Optional[str]):
-        """Sets which seat currently has an active control board overlay, pausing watchdog focus theft."""
+        """Whitelists a seat for the Control Board (shared across processes); None clears it."""
+        prev = self.overlay_seat
         self.overlay_seat = seat_id
-        logger.info(f"Kiosk watchdog overlay seat set to: {seat_id}")
+        if prev and prev != seat_id:
+            overlay_state.clear(prev)
+        if seat_id:
+            overlay_state.mark_active(seat_id)
+        logger.info(f"Kiosk watchdog overlay whitelist set to: {seat_id}")
 
-    def set_kiosk_above(self, seat_id: str, above: bool):
-        """Temporarily adds or removes the 'above' state from a seat's kiosk window."""
+    def _kiosk_window(self, seat_id: str) -> Optional[str]:
         win_id = self.window_ids.get(seat_id)
         if not win_id:
             self.discover_running_kiosks()
             win_id = self.window_ids.get(seat_id)
+        return win_id
+
+    def set_kiosk_above(self, seat_id: str, above: bool):
+        """Temporarily adds or removes the 'above' state from a seat's kiosk window."""
+        win_id = self._kiosk_window(seat_id)
         if win_id:
             action = "add" if above else "remove"
             run_command(["wmctrl", "-i", "-r", win_id, "-b", f"{action},above"])
             logger.info(f"Set kiosk window {win_id} for seat '{seat_id}' above={above}")
+
+    def demote_kiosk(self, seat_id: str):
+        """Pushes the seat's kiosk beneath everything so the overlay can sit on top."""
+        win_id = self._kiosk_window(seat_id)
+        if not win_id:
+            return
+        run_command(["wmctrl", "-i", "-r", win_id, "-b", "remove,above"])
+        run_command(["wmctrl", "-i", "-r", win_id, "-b", "add,below"])
+        run_command(["xdotool", "windowlower", win_id])
+
+    def force_unfullscreen_kiosk(self, seat_id: str):
+        """
+        Last resort: many WMs stack fullscreen windows over everything, including
+        'above' windows. Drop fullscreen (window keeps its monitor-sized geometry).
+        """
+        win_id = self._kiosk_window(seat_id)
+        if not win_id:
+            return
+        run_command(["wmctrl", "-i", "-r", win_id, "-b", "remove,fullscreen,above"])
+        run_command(["xdotool", "windowlower", win_id])
+        self._demoted_fs[seat_id] = True
+        logger.info(f"Kiosk {win_id} ({seat_id}) un-fullscreened so the overlay can take priority.")
+
+    def restore_kiosk(self, seat_id: str):
+        """Undoes demote/unfullscreen: kiosk returns to fullscreen + above."""
+        win_id = self._kiosk_window(seat_id)
+        if not win_id:
+            return
+        run_command(["wmctrl", "-i", "-r", win_id, "-b", "remove,below"])
+        run_command(["wmctrl", "-i", "-r", win_id, "-b", "add,fullscreen,above"])
+        self._demoted_fs.pop(seat_id, None)
+
+    @staticmethod
+    def _stack_index(win_id) -> int:
+        out, _, rc = run_command(["xprop", "-root", "_NET_CLIENT_LIST_STACKING"])
+        if rc != 0:
+            return -1
+        ids = [int(x, 16) for x in re.findall(r"0x[0-9a-fA-F]+", out)]
+        try:
+            return ids.index(int(str(win_id), 0))
+        except ValueError:
+            return -1
+
+    def is_stacked_above_kiosk(self, top_win, seat_id: str) -> bool:
+        """True if `top_win` is above the seat's kiosk in the WM stacking order."""
+        kiosk = self._kiosk_window(seat_id)
+        if not kiosk:
+            return True
+        t, k = self._stack_index(top_win), self._stack_index(kiosk)
+        return t == -1 or k == -1 or t > k
 
     def discover_running_kiosks(self) -> Dict[str, Dict]:
         """

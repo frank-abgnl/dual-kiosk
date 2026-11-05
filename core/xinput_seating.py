@@ -12,6 +12,7 @@ import logging
 from typing import Dict, List, Optional, Tuple
 
 from core.pointer_barriers import PointerConfiner
+from core import overlay_state
 
 logger = logging.getLogger("xinput_seating.engine")
 
@@ -197,15 +198,14 @@ class XInputSeatingEngine:
     def focus_seat_keyboard(self, seat_id: str, window_id) -> bool:
         """
         Binds a seat's kiosk window to its own master pointer/keyboard.
-        1. Client pointer of the browser -> seat's master pointer, so the browser's own
-           focus requests no longer hit the core keyboard.
-        2. Seat keyboard focus -> that window.
-        Every known seat is re-asserted each call, so a freshly opened browser can't
-        leave another seat's keyboard focused on the wrong window.
+        Seats whose Control Board overlay is whitelisted are skipped, otherwise a
+        tick for the *other* seat would steal focus back from the overlay.
         """
         self.seat_windows[seat_id] = str(window_id)
         ok = True
         for sid, win in list(self.seat_windows.items()):
+            if overlay_state.is_active(sid):
+                continue
             ptr = self.seat_pointers.get(sid)
             kbd = self.seat_keyboards.get(sid)
             if ptr is not None:
@@ -469,7 +469,7 @@ class XInputSeatingEngine:
                         self.copy_keyboard_layout(target_kbd_master)
 
                     win_id = self.seat_windows.get(seat_id)
-                    if win_id and isinstance(target_kbd_master, int):
+                    if win_id and isinstance(target_kbd_master, int) and not overlay_state.is_active(seat_id):
                         self.confiner.set_focus(target_kbd_master, win_id)
 
                     reseated_messages.append(
