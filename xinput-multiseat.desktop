@@ -1,7 +1,7 @@
 [Desktop Entry]
 Name=XInput Pseudo-Seating Control Panel
 Comment=Manage MPX dual-seat workstations and locked Firefox kiosks
-Exec=/home/aelaf/Projects/xinput/start.sh
+Exec=@APP_DIR@/start.sh
 Icon=preferences-desktop-display
 Terminal=false
 Type=Application

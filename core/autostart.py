@@ -194,106 +194,37 @@ def install_user_service() -> bool:
 def run_startup_reseat_and_launch(wait_timeout_sec: int = 20) -> bool:
     """
     Executed on system boot / power recovery.
-    1. Communicates with system to wait for X11/Xwayland server readiness.
-    2. Auto-identifies screen resolutions and connected USB input devices (mouses & keyboards).
-    3. Reseats hardware to Seat 1 and Seat 2 and saves configuration.
-    4. Applies XInput pseudo-seating and launches dual Firefox kiosks.
-    5. Keeps supervisor alive.
+    Delegates to the unified SessionManager and binds the GUI & desktop lifecycle.
     """
-    from core.device_manager import DeviceManager
-    from core.xinput_seating import XInputSeatingEngine
-    from core.kiosk_manager import KioskManager
-    from core.config_manager import ConfigManager
+    from core.session_manager import session_mgr
+    from core.hotkey_manager import HotkeyManager
 
     logger.info("Starting automated power outage recovery / boot reseating sequence...")
 
-    dev_mgr = DeviceManager()
-    cfg_mgr = ConfigManager()
-    engine = XInputSeatingEngine()
-    kiosk_mgr = KioskManager()
-    kiosk_mgr.on_window_ready = engine.focus_seat_keyboard
-
-    # 1. Wait for display server to be ready
     start_time = time.time()
-    displays = []
-    total = {"width": 1920, "height": 1080}
     while time.time() - start_time < wait_timeout_sec:
-        active_disp, total = dev_mgr.probe_and_activate_displays()
+        active_disp, _ = session_mgr.dm.probe_and_activate_displays()
         if active_disp:
-            displays = active_disp
             break
         time.sleep(1)
 
-    # Automatic display detection: require at least 2 connected displays
-    if len(displays) < 2:
-        disp_name = displays[0]["name"] if displays else "Unknown"
-        logger.warning(f"Startup check: Only {len(displays)} display connected ({disp_name}). Dual-seat kiosk requires 2 monitors.")
-        from gui.display_dialog import run_single_display_error_modal
-        ok_retry, new_disp = run_single_display_error_modal(displays)
-        if not ok_retry or not new_disp or len(new_disp) < 2:
-            logger.info("Startup aborted: Second display required.")
-            return False
-        displays = new_disp
-        total = dev_mgr.get_displays()[1]
-
-    logger.info(f"Detected {len(displays)} display(s): {[d['name'] + ' (' + str(d['width']) + 'x' + str(d['height']) + ')' for d in displays]}")
-
-    # 2. Auto-identify screen resolutions & assign connected USB devices
-    logger.info("Communicating with system to auto-identify screens and connected USB devices...")
-    cfg = cfg_mgr.auto_generate_config(dev_mgr)
-    seats = cfg.get("seats", [])
-
-    # Automatically assign displays to seats with priority and preference rules
-    seats, assign_msgs = dev_mgr.assign_displays_to_seats(seats, displays)
-    for m in assign_msgs:
-        logger.info(f"[Display Assignment] {m}")
-    cfg["seats"] = seats
-    cfg_mgr.save_config(cfg)
-
-    for s in seats:
-        logger.info(
-            f"Seat '{s.get('id')}': Display={s.get('display')}, "
-            f"Mouse={s.get('mouse_name')} (ID {s.get('mouse_id')}), "
-            f"Keyboard={s.get('keyboard_name')} (ID {s.get('keyboard_id')})"
-        )
-
-    # 3. Apply XInput seating
-    logger.info("Applying XInput MPX master pairs and device reattachments...")
-    results = engine.apply_seating(seats, displays, (total["width"], total["height"]))
-    logger.info(f"XInput mapping results: {results}")
-
-    # 4. Launch kiosks
-    s1_url = seats[0].get("kiosk_url", "https://duckduckgo.com") if len(seats) > 0 else "https://duckduckgo.com"
-    s2_url = seats[1].get("kiosk_url", "https://www.google.com") if len(seats) > 1 else "https://www.google.com"
-
-    logger.info("Launching dual Firefox kiosks with isolated profiles...")
-    ok = kiosk_mgr.launch_dual_kiosks(s1_url, s2_url, displays, enforce_lock=True)
-
+    ok, msg = session_mgr.start_session(on_event=logger.info)
     if ok:
         logger.info("Dual kiosks launched successfully on startup!")
-        from core.hotkey_manager import HotkeyManager
-        from core.display_guard import DisplayGuard
-
-        hotkey_mgr = HotkeyManager(launch_gui_if_needed=True, seat_keyboards=engine.seat_keyboards)
-        hotkey_mgr.start()
-        disp_guard = DisplayGuard(kiosk_mgr, engine, interval=1.2, on_event=logger.info)
-        disp_guard.start()
-
+        session_mgr.hotkey_mgr = HotkeyManager(launch_gui_if_needed=True, seat_keyboards=session_mgr.engine.seat_keyboards)
+        session_mgr.hotkey_mgr.start()
         logger.info("Super Keyboard Shortcut (Ctrl+Shift+M+S) listener active for kiosk overlay.")
         try:
             while True:
                 time.sleep(2)
-                reseated = engine.check_and_reseat_hotplugged_devices(seats, displays, (total["width"], total["height"]))
+                seats = session_mgr.cfg_mgr.load_config().get("seats", [])
+                reseated = session_mgr.engine.check_and_reseat_hotplugged_devices(seats)
                 if reseated:
                     for m in reseated:
                         logger.info(f"[Autostart Hotplug Reseat] {m}")
         except (KeyboardInterrupt, SystemExit):
             logger.info("Stopping kiosks, display guard, hotkey listener and resetting seating...")
-            disp_guard.stop()
-            hotkey_mgr.stop()
-            kiosk_mgr.stop_all_kiosks()
-            engine.reset_all_to_core()
+            session_mgr.stop_session(exit_gui=True, on_event=logger.info)
     else:
-        logger.error("Failed to launch kiosks on startup.")
-
+        logger.error(f"Failed to launch kiosks on startup: {msg}")
     return ok
