@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# XInput Pseudo-Seating & Dual Firefox Kiosk Launcher
+# XInput Pseudo-Seating & Dual Firefox Kiosk Launcher (Control Panel)
 # ==============================================================================
 set -e
 
@@ -16,12 +16,14 @@ command -v xrandr >/dev/null 2>&1 || MISSING+=("xorg-xrandr")
 command -v firefox >/dev/null 2>&1 || MISSING+=("firefox")
 command -v wmctrl >/dev/null 2>&1 || MISSING+=("wmctrl")
 command -v xdotool >/dev/null 2>&1 || MISSING+=("xdotool")
+command -v xkbcomp >/dev/null 2>&1 || MISSING+=("xorg-xkbcomp")
 
 if [ ${#MISSING[@]} -gt 0 ]; then
     echo "[!] Warning: The following dependencies are missing: ${MISSING[*]}"
     echo "    On Arch/CachyOS: sudo pacman -S --needed ${MISSING[*]}"
-    echo "    On Debian/Ubuntu: sudo apt-get install -y ${MISSING[*]}"
+    echo "    On Debian/Ubuntu: sudo apt-get install -y ${MISSING[*]/xorg-xkbcomp/x11-xkb-utils}"
     echo ""
 fi
+python3 -c "import Xlib" >/dev/null 2>&1 || echo "[!] python-xlib missing (kiosk shield window policing disabled): pip install --user python-xlib"
 
 exec python3 "${SCRIPT_DIR}/main.py" "$@"

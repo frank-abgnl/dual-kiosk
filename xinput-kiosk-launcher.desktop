@@ -1,0 +1,27 @@
+[Desktop Entry]
+Type=Application
+Name=XInput Kiosk Launcher
+Comment=Detect hardware, assign seats and launch the dual kiosks
+Exec=@APP_DIR@/launch.sh
+Icon=video-display
+Terminal=false
+Categories=System;Settings;HardwareSettings;
+Keywords=multiseat;kiosk;firefox;launcher;
+StartupNotify=false
+Actions=Reseat;Reassign;Stop;ControlBoard;
+
+[Desktop Action Reseat]
+Name=Re-seat devices (fix glitches)
+Exec=@APP_DIR@/launch.sh --reseat
+
+[Desktop Action Reassign]
+Name=Re-detect hardware and relaunch
+Exec=@APP_DIR@/launch.sh --reassign
+
+[Desktop Action Stop]
+Name=Stop kiosks and restore desktop
+Exec=@APP_DIR@/launch.sh --stop
+
+[Desktop Action ControlBoard]
+Name=Show Control Board
+Exec=@APP_DIR@/launch.sh --control-board

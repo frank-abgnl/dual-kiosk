@@ -52,6 +52,8 @@ class KioskManager:
         self.on_window_ready = None
         self.overlay_seat: Optional[str] = None
         self._demoted_fs: Dict[str, bool] = {}  # seat -> True if we removed fullscreen for the overlay
+        self.shield = None   # KioskShield (Super-key block + window policing)
+        self.engine = None   # XInputSeatingEngine (falls back to on_window_ready's owner)
 
         PROFILES_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -325,6 +327,7 @@ user_pref("app.update.enabled", false);
         if self._watchdog_thread:
             self._watchdog_thread.join(timeout=2)
             self._watchdog_thread = None
+        self.stop_shield()
         logger.info("Kiosk supervisor watchdog stopped.")
 
     def _watchdog_loop(self, interval_sec: float):
@@ -347,6 +350,9 @@ user_pref("app.update.enabled", false);
                     proc = self.running_processes.get(seat_id)
                     cfg = self.kiosk_configs.get(seat_id, {})
                     win_id = self.window_ids.get(seat_id)
+
+                if not cfg:  # seat torn down while we were iterating: never respawn
+                    continue
 
                 if proc is None or proc.poll() is not None:
                     if cfg.get("enforce_lock", True):
@@ -416,6 +422,7 @@ user_pref("app.update.enabled", false);
 
         if enforce_lock:
             self.start_watchdog()
+            self.start_shield()
 
         return ok1 and ok2
 
@@ -507,6 +514,23 @@ user_pref("app.update.enabled", false);
             return True
         t, k = self._stack_index(top_win), self._stack_index(kiosk)
         return t == -1 or k == -1 or t > k
+
+    # -----------------------------------------------------------------------
+    # Kiosk shield (Super-key block + window policing)
+    # -----------------------------------------------------------------------
+    def start_shield(self):
+        """Only the Control Board may ever cover a kiosk; see core/kiosk_shield.py."""
+        if self.shield and self.shield.is_running():
+            return
+        from core.kiosk_shield import KioskShield
+        engine = self.engine or getattr(self.on_window_ready, "__self__", None)
+        self.shield = KioskShield(self, engine)
+        self.shield.start()
+
+    def stop_shield(self):
+        sh, self.shield = self.shield, None
+        if sh:
+            sh.stop()
 
     def discover_running_kiosks(self) -> Dict[str, Dict]:
         """

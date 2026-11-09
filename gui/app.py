@@ -9,7 +9,9 @@ gi.require_version('Gtk', '3.0')
 from gi.repository import Gtk, Gdk, GLib, GdkX11
 
 import logging
+import os
 import subprocess
+import threading
 from pathlib import Path
 from typing import Optional
 
@@ -38,6 +40,9 @@ class XInputMultiseatApp(Gtk.ApplicationWindow):
         self.active_overlay_seat: Optional[str] = None
         self._overlay_mode_standalone: bool = overlay_mode
         self._overlay_hb_id = None
+        self._overlay_xid = None
+        self._hotplug_timer = None
+        self._hotplug_busy = False
 
         # ── Initialize Core Engines ───────────────────────────────────────
         self.device_mgr = DeviceManager()
@@ -45,6 +50,7 @@ class XInputMultiseatApp(Gtk.ApplicationWindow):
         self.kiosk_mgr = KioskManager()
         self.config_mgr = ConfigManager()
         self.kiosk_mgr.on_window_ready = self.seating_engine.focus_seat_keyboard
+        self.kiosk_mgr.engine = self.seating_engine
 
         # Discover already running kiosks (if any)
         self.kiosk_mgr.discover_running_kiosks()
@@ -176,31 +182,44 @@ class XInputMultiseatApp(Gtk.ApplicationWindow):
         GLib.idle_add(self.toggle_overlay, seat_id)
 
     def _on_xinput_hierarchy_changed(self):
-        """Called when an XInput device is plugged in, unplugged, or changed."""
-        GLib.idle_add(self._handle_hotplug_recheck)
+        """Device plugged / unplugged (called from the hotkey listener thread)."""
+        GLib.idle_add(self._schedule_hotplug_recheck)
+
+    def _schedule_hotplug_recheck(self):
+        """Debounce: a plug event is often followed by several more; check once they stop."""
+        if self._hotplug_timer:
+            GLib.source_remove(self._hotplug_timer)
+        self._hotplug_timer = GLib.timeout_add(900, self._run_hotplug_recheck)
+        return False
 
     def _periodic_hotplug_check(self):
-        """Heartbeat to ensure replugged peripherals are verified and reseated."""
-        self._handle_hotplug_recheck()
+        """Safety net; cheap because the engine returns early when nothing changed."""
+        self._run_hotplug_recheck()
         return True
 
-    def _handle_hotplug_recheck(self):
-        """Verifies locked peripherals and auto-reseats them if replugged into new ports."""
+    def _run_hotplug_recheck(self):
+        self._hotplug_timer = None
+        if self.seating_engine.owns_seating and not self._hotplug_busy:
+            self._hotplug_busy = True
+            threading.Thread(target=self._hotplug_worker, daemon=True).start()
+        return False
+
+    def _hotplug_worker(self):
+        """Runs xinput work off the GTK main thread (it used to freeze the UI and the pointers)."""
         try:
-            cfg = self.config_mgr.load_config()
-            seats = cfg.get("seats", [])
-            if self.seating_engine.seat_keyboards:
-                reseated = self.seating_engine.check_and_reseat_hotplugged_devices(seats)
-                if reseated:
-                    for msg in reseated:
-                        logger.info(f"[Hotplug Reseat] {msg}")
-                        self.dashboard_tab.append_log(f"⚡ {msg}")
-                    self.show_info(f"Peripheral reconnected and reseated ✓ ({len(reseated)} device(s))", 0)
-                    self.seats_tab.refresh()
-                    self.dashboard_tab.refresh_metrics()
+            seats = self.config_mgr.load_config().get("seats", [])
+            msgs = self.seating_engine.check_and_reseat_hotplugged_devices(seats)
+            for msg in msgs:
+                logger.info(f"[Hotplug] {msg}")
+                self.dashboard_tab.append_log(f"⚡ {msg}")
+            if msgs:
+                GLib.idle_add(self.show_info, msgs[-1], 0)
+                GLib.idle_add(self.seats_tab.refresh)
+                GLib.idle_add(self.dashboard_tab.refresh_metrics)
         except Exception as exc:
             logger.debug(f"Hotplug check notice: {exc}")
-        return False
+        finally:
+            self._hotplug_busy = False
 
     def _on_key_press(self, _widget, event):
         """Keyboard shortcut handler inside the GUI window."""
@@ -228,7 +247,7 @@ class XInputMultiseatApp(Gtk.ApplicationWindow):
         if not self.is_overlay_active or not self.active_overlay_seat:
             self._overlay_hb_id = None
             return False
-        overlay_state.mark_active(self.active_overlay_seat)
+        overlay_state.mark_active(self.active_overlay_seat, xid=self._overlay_xid, pid=os.getpid())
         return True
 
     def show_overlay(self, seat_id: str = "seat1"):
@@ -243,6 +262,7 @@ class XInputMultiseatApp(Gtk.ApplicationWindow):
         self.is_overlay_active = True
         self.active_overlay_seat = seat_id
 
+        self._ensure_masters()
         if self.seating_engine.seat_keyboards:
             self.hotkey_mgr.update_seat_keyboards(self.seating_engine.seat_keyboards)
 
@@ -281,7 +301,16 @@ class XInputMultiseatApp(Gtk.ApplicationWindow):
         # Wait briefly so the window is mapped before applying WM hints / focus
         GLib.timeout_add(150, self._apply_overlay_wm_and_focus, seat_id, pos_x, pos_y, win_w, win_h)
 
+    def _ensure_masters(self):
+        """When seating was applied by the launcher/autostart process, learn its master IDs."""
+        if not self.seating_engine.seat_pointers:
+            try:
+                self.seating_engine.discover_masters(self.config_mgr.load_config().get("seats", []))
+            except Exception as exc:
+                logger.debug(f"Master discovery notice: {exc}")
+
     def _bind_overlay_input(self, seat_id: str, xid_hex: str):
+        self._ensure_masters()
         ptr_id = self.seating_engine.seat_pointers.get(seat_id)
         kbd_id = self.seating_engine.seat_keyboards.get(seat_id)
         if ptr_id:
@@ -298,7 +327,9 @@ class XInputMultiseatApp(Gtk.ApplicationWindow):
             return False
 
         try:
-            xid_hex = hex(gdk_win.get_xid())
+            self._overlay_xid = gdk_win.get_xid()
+            xid_hex = hex(self._overlay_xid)
+            overlay_state.mark_active(seat_id, xid=self._overlay_xid, pid=os.getpid())  # shield: allow this window
             subprocess.run(["wmctrl", "-i", "-r", xid_hex, "-b", "add,above"], capture_output=True)
             subprocess.run(["wmctrl", "-i", "-r", xid_hex, "-e", f"0,{pos_x},{pos_y},{win_w},{win_h}"], capture_output=True)
             subprocess.run(["wmctrl", "-i", "-a", xid_hex], capture_output=True)

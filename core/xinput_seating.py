@@ -9,9 +9,12 @@ import os
 import subprocess
 import re
 import logging
+import threading
+import time
 from typing import Dict, List, Optional, Tuple
 
 from core.pointer_barriers import PointerConfiner
+from core.peripheral_resolver import KEYS, PROMOTE_AFTER_SEC, PeripheralMemory, PeripheralResolver
 from core import overlay_state
 
 logger = logging.getLogger("xinput_seating.engine")
@@ -44,6 +47,16 @@ class XInputSeatingEngine:
         self.seat_keyboards: Dict[str, int] = {}  # seat_id -> master keyboard id
         self.seat_pointers: Dict[str, int] = {}   # seat_id -> master pointer id
         self.seat_windows: Dict[str, str] = {}    # seat_id -> kiosk window id
+        # Only the process that applied the seating may reseat hotplugged devices.
+        self.owns_seating = False
+        self.memory = PeripheralMemory()                   # short-term seat memory + stand-in clocks
+        self.resolver = PeripheralResolver(self._promote_after())
+        self._last_refresh = 0.0
+        self._hotplug_lock = threading.Lock()
+        self._verified_sig = None                          # topology we already verified
+        self._attempts: Dict[tuple, int] = {}
+        self._last_reseat: Dict[Tuple[str, str], float] = {}
+        self._absent: set = set()
 
     # -----------------------------------------------------------------------
     # Master Pair Management
@@ -217,6 +230,91 @@ class XInputSeatingEngine:
     # -----------------------------------------------------------------------
     # Screen Confinement
     # -----------------------------------------------------------------------
+    # -----------------------------------------------------------------------
+    # Live device resolution (stable, one-to-one)
+    # -----------------------------------------------------------------------
+    def _seat_masters(self, seats_config: List[Dict]) -> Dict[str, Dict]:
+        m = {}
+        for i, s in enumerate(seats_config):
+            sid = s.get("id", f"seat{i + 1}")
+            if s.get("is_primary", False):
+                m[sid] = {"pointer": self.CORE_POINTER_ID, "keyboard": self.CORE_KEYBOARD_ID}
+            else:
+                m[sid] = {"pointer": self.seat_pointers.get(sid), "keyboard": self.seat_keyboards.get(sid)}
+        return m
+
+    @staticmethod
+    def _promote_after() -> float:
+        """Hours a stand-in must stay connected before it becomes the locked device (default 3)."""
+        try:
+            from core.config_manager import ConfigManager
+            hours = ConfigManager().load_config().get("settings", {}).get("peripheral_promote_hours", 3)
+            return float(hours) * 3600
+        except Exception:
+            return PROMOTE_AFTER_SEC
+
+    def _persist_lock(self, seat_id: str, cls: str, name: str, ident: Dict):
+        """Writes a (new) locked device into config.json."""
+        try:
+            from core.config_manager import ConfigManager
+            cm = ConfigManager()
+            cfg = cm.load_config()
+            name_k, _, ident_k = KEYS[cls]
+            for seat in cfg.get("seats", []):
+                if seat.get("id") == seat_id:
+                    seat[name_k], seat[ident_k] = name, ident
+            cm.save_config(cfg)
+        except Exception as exc:
+            logger.warning(f"Could not persist locked device for {seat_id}: {exc}")
+
+    def _handle_events(self, events: List[Dict]) -> List[str]:
+        """Persists lock changes and turns resolver events into human-readable messages."""
+        msgs = []
+        for ev in events:
+            label = "Mouse" if ev["cls"] == "pointer" else "Keyboard"
+            sid, name, locked = ev["seat"], ev["name"], ev.get("locked") or "?"
+            if ev["type"] == "lock_ident":
+                self._persist_lock(sid, ev["cls"], name, ev["ident"])
+            elif ev["type"] == "promote":
+                self._persist_lock(sid, ev["cls"], name, ev["ident"])
+                msgs.append(f"{label} '{name}' has served Seat '{sid}' for {self.resolver.promote_after / 3600:g} h "
+                            f"-> now the LOCKED device (old locked '{locked}' forgotten)")
+            elif ev["type"] == "substitute":
+                msgs.append(f"{label} '{name}' seated on Seat '{sid}' as stand-in for missing locked '{locked}'")
+            elif ev["type"] == "locked_back":
+                msgs.append(f"Locked {label} '{name}' is back on Seat '{sid}' (stand-in released)")
+        return msgs
+
+    def resolve_live(self, seats_config: List[Dict]):
+        """Maps saved seat peripherals to live xinput devices. Returns (resolved_seats, assignments)."""
+        from core.device_manager import DeviceManager
+        _, ptrs, kbds = DeviceManager().get_xinput_hierarchy()
+        resolved, assignments, events, _ = self.resolver.resolve(
+            seats_config, ptrs, kbds, self._seat_masters(seats_config), self.memory)
+        for m in self._handle_events(events):
+            logger.info(f"[Seat Resolver] {m}")
+        self.memory.save()
+        return resolved, assignments
+
+    def discover_masters(self, seats_config: List[Dict]) -> bool:
+        """
+        Learns master IDs created by ANOTHER process (launcher / autostart) so this process
+        (e.g. the overlay GUI) can bind its window to the right seat keyboard and pointer.
+        """
+        masters = self.get_existing_masters()
+        found = False
+        for i, s in enumerate(seats_config):
+            sid = s.get("id", f"seat{i + 1}")
+            if s.get("is_primary", False):
+                self.seat_pointers[sid], self.seat_keyboards[sid] = self.CORE_POINTER_ID, self.CORE_KEYBOARD_ID
+                found = True
+            else:
+                m = masters.get(f"Seat_{sid.upper()}")
+                if m:
+                    self.seat_pointers[sid], self.seat_keyboards[sid] = m["pointer_id"], m["keyboard_id"]
+                    found = True
+        return found
+
     def _is_absolute(self, dev_id) -> bool:
         """True for tablets/touchscreens. Normal mice are relative."""
         out, _, rc = run_command(["xinput", "list", str(dev_id)])
@@ -278,6 +376,9 @@ class XInputSeatingEngine:
         self.seat_keyboards.clear()
         self.seat_pointers.clear()
         self.seat_windows.clear()
+        self.owns_seating = False
+        self._verified_sig = None
+        self._absent.clear()
 
         from core.device_manager import DeviceManager
         dm = DeviceManager()
@@ -331,13 +432,13 @@ class XInputSeatingEngine:
         - Seat 2 creates/uses a master pair and attaches assigned devices.
         - Each seat's master pointer is confined to its monitor with pointer barriers.
         """
-        # Resolve live IDs for locked peripheral names across USB ports
-        from core.device_manager import DeviceManager
-        dm = DeviceManager()
-        resolved_seats, resolve_msgs = dm.resolve_seat_devices(seats_config, preserve_memory=True)
-        for msg in resolve_msgs:
-            logger.info(f"[Seat Resolver] {msg}")
+        # Resolve live devices one-to-one (never trusts stale IDs, never shares a device)
+        resolved_seats, assignments = self.resolve_live(seats_config)
+        for (sid, cls), dev in assignments.items():
+            logger.info(f"[Seat Resolver] {sid} {cls}: " + (f"{dev['name']} (ID {dev['id']})" if dev else "not connected"))
         seats_config = resolved_seats
+        self.owns_seating = True
+        self._verified_sig = None
 
         results = {}
         disp_map = {d["name"]: d for d in displays_info} if displays_info else {}
@@ -391,6 +492,9 @@ class XInputSeatingEngine:
 
         return results
 
+    SETTLE_SEC = 0.8        # topology must be unchanged this long before we touch anything
+    RESEAT_COOLDOWN = 2.5   # never reseat the same seat device more often than this
+
     def check_and_reseat_hotplugged_devices(
         self,
         seats_config: List[Dict],
@@ -398,82 +502,137 @@ class XInputSeatingEngine:
         total_screen: Optional[Tuple[int, int]] = None,
     ) -> List[str]:
         """
-        Scans connected hardware against locked peripheral names for each seat.
-        If a peripheral was unplugged and replugged (even into a different port,
-        gaining a new XInput ID, or getting attached back to Virtual core by Xorg),
-        it dynamically reattaches it to its locked master, re-confines pointer,
-        copies layout, and re-focuses its kiosk window.
-        Returns a list of human-readable log messages describing actions taken.
+        Stabilised hotplug handling. Cheap when nothing changed (one `xinput list`), and when
+        something changed it waits for the topology to settle, resolves devices one-to-one,
+        and only reattaches devices that are really on the wrong master. Unplugged devices are
+        ignored (no stale-ID reattaches, no pointer warps, other seats untouched).
+        Returns human-readable messages.
         """
-        if not self.seat_keyboards and not self.seat_pointers:
-            return []  # Seating is not active
+        if not self.owns_seating:
+            return []
+        if not self._hotplug_lock.acquire(blocking=False):
+            return []
+        try:
+            return self._reseat_if_needed(seats_config, displays_info, total_screen)
+        except Exception as exc:
+            logger.warning(f"Hotplug check failed: {exc}")
+            return []
+        finally:
+            self._hotplug_lock.release()
 
+    @staticmethod
+    def _topology_sig(ptrs, kbds):
+        return tuple(sorted((d["id"], d["name"], d.get("attachment"))
+                            for d in ptrs + kbds if not d["is_xtest"]))
+
+    def _sibling_nodes(self, dev_id: int, pool: List[Dict]) -> List[Dict]:
+        parent = self._usb_parent(dev_id)
+        if not parent:
+            return []
+        return [x for x in pool if x["id"] != dev_id and not x["is_xtest"] and self._usb_parent(x["id"]) == parent]
+
+    def _reseat_if_needed(self, seats_config, displays_info, total_screen) -> List[str]:
         from core.device_manager import DeviceManager
         dm = DeviceManager()
-        if displays_info is None:
-            displays_info, total = dm.get_displays()
-            if total_screen is None and total:
-                total_screen = (total.get("width", 1920), total.get("height", 1080))
+        masters, ptrs, kbds = dm.get_xinput_hierarchy()
+        if not masters and not ptrs and not kbds:
+            return []  # xinput failed: never act on an empty reading
+        sig = self._topology_sig(ptrs, kbds)
+        now0 = time.time()
+        if self._verified_sig is not None and now0 - self._last_refresh > 60 and self.memory.has_subs():
+            self._last_refresh = now0          # stand-in clocks need a periodic look (promotion after 3 h)
+            self._verified_sig = None
+        if sig == self._verified_sig:
+            return []
 
-        disp_map = {d["name"]: d for d in displays_info} if displays_info else {}
-        resolved_seats, _ = dm.resolve_seat_devices(seats_config, preserve_memory=True)
-        masters, ptr_slaves, kbd_slaves = dm.get_xinput_hierarchy()
+        time.sleep(self.SETTLE_SEC)  # let a plug / replug finish
+        masters, ptrs, kbds = dm.get_xinput_hierarchy()
+        if self._topology_sig(ptrs, kbds) != sig:
+            return []  # still changing; the next tick re-evaluates
+        if self._attempts.get(sig, 0) >= 3:
+            self._verified_sig = sig  # give up on this exact state instead of looping
+            return []
 
-        current_ptr_att = {p["id"]: p.get("attachment") for p in ptr_slaves}
-        current_kbd_att = {k["id"]: k.get("attachment") for k in kbd_slaves}
+        resolved, assignments, events, spares = self.resolver.resolve(
+            seats_config, ptrs, kbds, self._seat_masters(seats_config), self.memory)
 
-        reseated_messages = []
+        msgs: List[str] = self._handle_events(events)
+        acted = deferred = False
+        now = time.time()
+        disp_map = {d["name"]: d for d in displays_info} if displays_info else None
 
-        for seat in resolved_seats:
-            seat_id = seat.get("id", "seat1")
+        for idx, seat in enumerate(resolved):
+            sid = seat.get("id", f"seat{idx + 1}")
             is_primary = seat.get("is_primary", False)
             disp_name = seat.get("display")
+            for cls, label, name_key, pool in (("pointer", "Mouse", "mouse_name", ptrs),
+                                               ("keyboard", "Keyboard", "keyboard_name", kbds)):
+                dev = assignments.get((sid, cls))
+                saved_name = seat.get(name_key) or ""
+                if not dev:
+                    if saved_name and (sid, cls) not in self._absent:
+                        self._absent.add((sid, cls))
+                        msgs.append(f"{label} '{saved_name}' of Seat '{sid}' unplugged - waiting for it "
+                                    f"(other seats unaffected)")
+                    continue
+                if (sid, cls) in self._absent:
+                    self._absent.discard((sid, cls))
+                    msgs.append(f"{label} '{dev['name']}' of Seat '{sid}' reconnected")
 
-            target_ptr_master = self.seat_pointers.get(seat_id, self.CORE_POINTER_ID if is_primary else None)
-            target_kbd_master = self.seat_keyboards.get(seat_id, self.CORE_KEYBOARD_ID if is_primary else None)
+                target = (self.CORE_POINTER_ID if cls == "pointer" else self.CORE_KEYBOARD_ID) if is_primary \
+                    else (self.seat_pointers if cls == "pointer" else self.seat_keyboards).get(sid)
+                if not isinstance(target, int) or target not in masters:
+                    continue
 
-            # 1. Mouse check
-            mouse_id = seat.get("mouse_id")
-            mouse_name = seat.get("mouse_name")
-            if mouse_id and target_ptr_master:
-                curr_att = current_ptr_att.get(mouse_id)
-                if curr_att != target_ptr_master:
-                    logger.info(
-                        f"Re-attaching replugged mouse '{mouse_name}' (ID {mouse_id}) to seat '{seat_id}' master {target_ptr_master}..."
-                    )
-                    self.attach_with_siblings(mouse_id, target_ptr_master, "pointer")
+                wrong_sibs = [x for x in self._sibling_nodes(dev["id"], pool) if x.get("attachment") != target]
+                if dev.get("attachment") == target and not wrong_sibs:
+                    continue
+                if now - self._last_reseat.get((sid, cls), 0) < self.RESEAT_COOLDOWN:
+                    deferred = True
+                    continue
+
+                if dev.get("attachment") != target:
+                    self.reattach_device(dev["id"], target)
+                for x in wrong_sibs:
+                    self.reattach_device(x["id"], target)
+                self._last_reseat[(sid, cls)] = now
+                acted = True
+
+                if cls == "keyboard" and not is_primary:
+                    self.copy_keyboard_layout(target)
+                    win_id = self.seat_windows.get(sid)
+                    if win_id and not overlay_state.is_active(sid):
+                        self.confiner.set_focus(target, win_id)
+                if cls == "pointer":
                     if disp_name:
-                        self.map_pointer_to_output(mouse_id, disp_name)
+                        self.map_pointer_to_output(dev["id"], disp_name)
+                    # Barriers belong to the master and survive a mouse replug: only rebuild a missing one.
+                    if not is_primary and target not in self.confiner._barriers:
+                        if disp_map is None:
+                            disp_map = {d["name"]: d for d in dm.get_displays()[0]}
+                        d = disp_map.get(disp_name)
+                        if d and d.get("width") and d.get("height"):
+                            self.confine_master(target, (d["width"], d["height"], d["x"], d["y"]), total_screen)
+                msgs.append(f"{label} '{dev['name']}' (ID {dev['id']}) was on the wrong master -> "
+                            f"reseated to Seat '{sid}'")
 
-                    if not is_primary and isinstance(target_ptr_master, int) and disp_name in disp_map:
-                        d = disp_map[disp_name]
-                        if d.get("width") and d.get("height"):
-                            geom = (d["width"], d["height"], d["x"], d["y"])
-                            self.confine_master(target_ptr_master, geom, total_screen)
+        # Spares: external devices parked on a seat master that no seat needs go back to the desktop master
+        for cls, c in spares:
+            key = ("spare", c["id"])
+            if now - self._last_reseat.get(key, 0) < self.RESEAT_COOLDOWN:
+                deferred = True
+                continue
+            self.reattach_device(c["id"], self.CORE_POINTER_ID if cls == "pointer" else self.CORE_KEYBOARD_ID)
+            self._last_reseat[key] = now
+            acted = True
+            msgs.append(f"Spare {'mouse' if cls == 'pointer' else 'keyboard'} '{c['name']}' released from its seat "
+                        f"(no seat needs it)")
 
-                    reseated_messages.append(
-                        f"Mouse '{mouse_name}' (ID {mouse_id}) replugged -> auto-reseated to Seat '{seat_id}' (Display: {disp_name})"
-                    )
-
-            # 2. Keyboard check
-            kbd_id = seat.get("keyboard_id")
-            kbd_name = seat.get("keyboard_name")
-            if kbd_id and target_kbd_master:
-                curr_att = current_kbd_att.get(kbd_id)
-                if curr_att != target_kbd_master:
-                    logger.info(
-                        f"Re-attaching replugged keyboard '{kbd_name}' (ID {kbd_id}) to seat '{seat_id}' master {target_kbd_master}..."
-                    )
-                    self.attach_with_siblings(kbd_id, target_kbd_master, "keyboard")
-                    if not is_primary and isinstance(target_kbd_master, int):
-                        self.copy_keyboard_layout(target_kbd_master)
-
-                    win_id = self.seat_windows.get(seat_id)
-                    if win_id and isinstance(target_kbd_master, int) and not overlay_state.is_active(seat_id):
-                        self.confiner.set_focus(target_kbd_master, win_id)
-
-                    reseated_messages.append(
-                        f"Keyboard '{kbd_name}' (ID {kbd_id}) replugged -> auto-reseated to Seat '{seat_id}' (Display: {disp_name})"
-                    )
-
-        return reseated_messages
+        self.memory.save()
+        if acted or deferred:
+            self._verified_sig = None                       # re-verify once our own changes settle
+            self._attempts[sig] = self._attempts.get(sig, 0) + 1
+        else:
+            self._verified_sig = sig
+            self._attempts.clear()
+        return msgs
