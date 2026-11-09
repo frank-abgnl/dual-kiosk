@@ -87,27 +87,13 @@ def cmd_control_board(seat: str) -> int:
 
 def emergency_cleanup():
     """Kills leftover kiosk browsers and returns every input device to Virtual core."""
-    from core.uninstaller import Uninstaller
-    from core.xinput_seating import XInputSeatingEngine
-    from core import overlay_state
-    u = Uninstaller()
-    u._terminate(u.find_kiosks(), "kiosk browsers")
-    XInputSeatingEngine().reset_all_to_core()
-    overlay_state.clear()
+    from core.session_manager import session_mgr
+    session_mgr.stop_session()
 
 
 def cmd_stop() -> int:
-    pid = _read_pid()
-    if pid:
-        log.info(f"Stopping launcher session (pid {pid})...")
-        os.kill(pid, signal.SIGTERM)
-        for _ in range(60):
-            if not _pid_alive(pid):
-                break
-            time.sleep(0.25)
-        else:
-            os.kill(pid, signal.SIGKILL)
-    emergency_cleanup()
+    from core.session_manager import session_mgr
+    session_mgr.stop_session(on_event=notify)
     notify("Kiosks stopped, input devices returned to the normal desktop.")
     return 0
 
@@ -220,7 +206,7 @@ def launch(args) -> int:
     signal.signal(signal.SIGUSR1, lambda *_: request_reseat(False))
     signal.signal(signal.SIGUSR2, lambda *_: request_reseat(True))
 
-    hotkey = reseat_key = None
+    hotkey = reseat_key = display_guard = None
     try:
         notify("Detecting displays and input devices...")
         emergency_cleanup()  # clean slate: no stale masters, kiosks or barriers
@@ -229,11 +215,31 @@ def launch(args) -> int:
             notify("No display detected.", urgent=True)
             return 1
 
+        # Automatic display detection: Require at least 2 displays
+        active_disp, total = dm.probe_and_activate_displays()
+        if len(active_disp) < 2:
+            log.warning(f"Only {len(active_disp)} display detected at startup. Dual kiosk requires at least 2.")
+            notify("Only one display detected. Waiting for second monitor to be connected...", urgent=True)
+            from gui.display_dialog import run_single_display_error_modal
+            ok_retry, new_disp = run_single_display_error_modal(active_disp)
+            if not ok_retry or not new_disp or len(new_disp) < 2:
+                log.info("Display error dialog cancelled or second display not found. Launch aborted.")
+                notify("Launch aborted: Dual kiosks require two connected displays.")
+                return 1
+            displays = new_disp
+            total = dm.get_displays()[1]
+        else:
+            displays = active_disp
+
         cfg = args.no_detect and cfg_mgr.load_config() or detect_and_assign(cfg_mgr, dm, engine, args.reassign)
         seats = cfg.get("seats", [])
-        displays, total = dm.get_displays()
-        if len(displays) < 2:
-            log.warning("Only one display detected: both seats will share it.")
+
+        # Automatically assign displays to seats respecting preferences and priority rules
+        seats, assign_msgs = dm.assign_displays_to_seats(seats, displays)
+        for m in assign_msgs:
+            log.info(f"[Display Assignment] {m}")
+        cfg["seats"] = seats
+        cfg_mgr.save_config(cfg)
 
         results = engine.apply_seating(seats, displays, (total["width"], total["height"]))
         log.info(f"Seating applied: {results}")
@@ -246,6 +252,11 @@ def launch(args) -> int:
         ok = launch_kiosks(seats, displays)
         notify("Kiosks running. Ctrl+Shift+M+S opens the Control Board." if ok
                else "A kiosk failed to start - see ~/.config/xinput-seats/launcher.log", urgent=not ok)
+
+        # Start DisplayGuard to monitor runtime display disconnects and handle Retry
+        from core.display_guard import DisplayGuard
+        display_guard = DisplayGuard(kiosk, engine, interval=1.2, on_event=notify)
+        display_guard.start()
 
         gui_until = [0.0]
 
@@ -310,17 +321,9 @@ def launch(args) -> int:
         notify(f"Launcher failed: {exc}", urgent=True)
         return 1
     finally:
-        log.info("Shutting down: stopping shield, kiosks and restoring devices...")
-        if hotkey:
-            hotkey.stop()
-        if reseat_key:
-            reseat_key.stop()
-        kiosk.stop_all_kiosks()
-        engine.reset_all_to_core()
-        try:
-            PID_FILE.unlink()
-        except OSError:
-            pass
+        log.info("Shutting down launcher session...")
+        from core.session_manager import session_mgr
+        session_mgr.stop_session(on_event=log.info)
 
 
 def main():

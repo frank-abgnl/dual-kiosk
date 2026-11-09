@@ -218,11 +218,23 @@ def run_startup_reseat_and_launch(wait_timeout_sec: int = 20) -> bool:
     displays = []
     total = {"width": 1920, "height": 1080}
     while time.time() - start_time < wait_timeout_sec:
-        displays, total = dev_mgr.get_displays()
-        active_disp = [d for d in displays if d.get("active") and d.get("width", 0) > 0]
+        active_disp, total = dev_mgr.probe_and_activate_displays()
         if active_disp:
+            displays = active_disp
             break
         time.sleep(1)
+
+    # Automatic display detection: require at least 2 connected displays
+    if len(displays) < 2:
+        disp_name = displays[0]["name"] if displays else "Unknown"
+        logger.warning(f"Startup check: Only {len(displays)} display connected ({disp_name}). Dual-seat kiosk requires 2 monitors.")
+        from gui.display_dialog import run_single_display_error_modal
+        ok_retry, new_disp = run_single_display_error_modal(displays)
+        if not ok_retry or not new_disp or len(new_disp) < 2:
+            logger.info("Startup aborted: Second display required.")
+            return False
+        displays = new_disp
+        total = dev_mgr.get_displays()[1]
 
     logger.info(f"Detected {len(displays)} display(s): {[d['name'] + ' (' + str(d['width']) + 'x' + str(d['height']) + ')' for d in displays]}")
 
@@ -230,6 +242,13 @@ def run_startup_reseat_and_launch(wait_timeout_sec: int = 20) -> bool:
     logger.info("Communicating with system to auto-identify screens and connected USB devices...")
     cfg = cfg_mgr.auto_generate_config(dev_mgr)
     seats = cfg.get("seats", [])
+
+    # Automatically assign displays to seats with priority and preference rules
+    seats, assign_msgs = dev_mgr.assign_displays_to_seats(seats, displays)
+    for m in assign_msgs:
+        logger.info(f"[Display Assignment] {m}")
+    cfg["seats"] = seats
+    cfg_mgr.save_config(cfg)
 
     for s in seats:
         logger.info(
@@ -253,8 +272,13 @@ def run_startup_reseat_and_launch(wait_timeout_sec: int = 20) -> bool:
     if ok:
         logger.info("Dual kiosks launched successfully on startup!")
         from core.hotkey_manager import HotkeyManager
+        from core.display_guard import DisplayGuard
+
         hotkey_mgr = HotkeyManager(launch_gui_if_needed=True, seat_keyboards=engine.seat_keyboards)
         hotkey_mgr.start()
+        disp_guard = DisplayGuard(kiosk_mgr, engine, interval=1.2, on_event=logger.info)
+        disp_guard.start()
+
         logger.info("Super Keyboard Shortcut (Ctrl+Shift+M+S) listener active for kiosk overlay.")
         try:
             while True:
@@ -264,7 +288,8 @@ def run_startup_reseat_and_launch(wait_timeout_sec: int = 20) -> bool:
                     for m in reseated:
                         logger.info(f"[Autostart Hotplug Reseat] {m}")
         except (KeyboardInterrupt, SystemExit):
-            logger.info("Stopping kiosks, hotkey listener and resetting seating...")
+            logger.info("Stopping kiosks, display guard, hotkey listener and resetting seating...")
+            disp_guard.stop()
             hotkey_mgr.stop()
             kiosk_mgr.stop_all_kiosks()
             engine.reset_all_to_core()

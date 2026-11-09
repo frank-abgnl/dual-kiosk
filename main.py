@@ -163,10 +163,32 @@ def run_cli(args):
         return
 
     if args.start:
+        print("[*] Checking display hardware (requires at least 2 connected monitors)...")
+        active_disp, total = dev_mgr.probe_and_activate_displays()
+        if len(active_disp) < 2:
+            disp_name = active_disp[0]["name"] if active_disp else "unknown"
+            print(f"[!] Error: Only 1 display connected ({disp_name}). Dual-seat kiosk requires at least 2 displays.")
+            print("[*] Launching display error dialog with Retry button...")
+            from gui.display_dialog import run_single_display_error_modal
+            ok_retry, new_disp = run_single_display_error_modal(active_disp)
+            if not ok_retry or not new_disp or len(new_disp) < 2:
+                print("[✗] Start aborted: Dual kiosk requires two connected displays.")
+                return
+            displays = new_disp
+            total = dev_mgr.get_displays()[1]
+        else:
+            displays = active_disp
+
         print("[*] Loading seating configuration...")
         cfg = cfg_mgr.load_config()
         seats = cfg.get("seats", [])
-        displays, total = dev_mgr.get_displays()
+
+        # Assign displays to seats respecting preferences and priority
+        seats, assign_msgs = dev_mgr.assign_displays_to_seats(seats, displays)
+        for m in assign_msgs:
+            print(f"[✓] {m}")
+        cfg["seats"] = seats
+        cfg_mgr.save_config(cfg)
 
         print("[*] Applying XInput MPX master pairs and device reattachments...")
         results = engine.apply_seating(seats, displays, (total["width"], total["height"]))
@@ -180,8 +202,13 @@ def run_cli(args):
         if ok:
             print("[✓] Dual Firefox kiosks launched successfully!")
             from core.hotkey_manager import HotkeyManager
+            from core.display_guard import DisplayGuard
+
             hotkey_mgr = HotkeyManager(launch_gui_if_needed=True, seat_keyboards=engine.seat_keyboards)
             hotkey_mgr.start()
+            disp_guard = DisplayGuard(kiosk_mgr, engine, interval=1.2, on_event=lambda m: print(f"[Display] {m}"))
+            disp_guard.start()
+
             print("    ⚡ Super Shortcut: Press Ctrl+Shift+M+S on any seat to overlay the control board.")
             print("    Press Ctrl+C to stop kiosks and reset seating.")
             try:
@@ -193,7 +220,8 @@ def run_cli(args):
                         for m in reseated:
                             print(f"[✓] Hotplug: {m}")
             except KeyboardInterrupt:
-                print("\n[*] Stopping kiosks, hotkey listener and resetting devices...")
+                print("\n[*] Stopping kiosks, display guard, hotkey listener and resetting devices...")
+                disp_guard.stop()
                 hotkey_mgr.stop()
                 kiosk_mgr.stop_all_kiosks()
                 engine.reset_all_to_core()

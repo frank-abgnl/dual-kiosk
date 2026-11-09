@@ -6,16 +6,22 @@ While seating is running in this process:
   * A seat whose configured display disappears is put to SLEEP: its Firefox kiosk is
     closed (so it never jumps to the remaining monitor), its mouse/keyboard are floated
     (so they cannot type into the other seat) and its pointer barrier is released.
-  * When the display is detected again, the layout is forced back to EXTENDED mode
-    (never mirrored), the seat's devices are reseated, the pointer is re-confined and the
-    kiosk browser is relaunched on that monitor.
+  * A warning dialog is presented on the active monitor with a [Retry] button for the
+    user to adjust physical connections and re-ping the device.
+  * When the display is detected again (either via Retry button or automatic detection),
+    the layout is forced back to EXTENDED mode (never mirrored), newly detected displays
+    are automatically assigned to the seat according to preference & priority rules,
+    the seat's devices are reseated, the pointer is re-confined, the second screen is
+    launched, and the warning dialog is dismissed.
 
 Settings (config.json -> "settings", both default to true when absent):
     display_sleep_mode, auto_extended_display
 """
 
 import logging
+import os
 import subprocess
+import sys
 import threading
 import time
 from typing import Callable, Dict, List, Optional, Tuple
@@ -121,7 +127,7 @@ def ensure_extended(displays: List[Dict], saved_layout: Optional[Dict] = None) -
 
 class DisplayGuard:
     MISS_TO_SLEEP = 2   # consecutive polls without the display before sleeping
-    HIT_TO_WAKE = 2     # consecutive polls with the display before waking
+    HIT_TO_WAKE = 1     # polls with the display before waking
 
     def __init__(self, kiosk_mgr, engine=None, interval: float = 1.0,
                  on_event: Optional[Callable[[str], None]] = None):
@@ -139,6 +145,7 @@ class DisplayGuard:
         self._hit: Dict[str, int] = {}
         self._retry_at: Dict[str, float] = {}
         self._last_ext = 0.0
+        self._warning_proc: Optional[subprocess.Popen] = None
 
     # ------------------------------------------------------------------
     def start(self):
@@ -151,6 +158,7 @@ class DisplayGuard:
 
     def stop(self):
         self._stop.set()
+        self._dismiss_warning_dialog()
         t = self._thread
         if t and t is not threading.current_thread():
             t.join(timeout=3)
@@ -169,7 +177,7 @@ class DisplayGuard:
                 logger.debug(f"on_event failed: {exc}")
 
     def _loop(self):
-        while not self._stop.wait(self.interval):
+        while not self._stop.wait(0.3 if self._warning_proc else self.interval):
             try:
                 self._tick()
             except Exception as exc:
@@ -196,18 +204,34 @@ class DisplayGuard:
         displays, _ = self.dm.get_displays()
         if not displays:  # xrandr hiccup: never sleep on an empty reading
             return
+
+        active_displays = [d for d in displays if d.get("connected", True) and d.get("width", 0) > 0]
         by_name = {d["name"]: d for d in displays}
         changed = False
+
+        # If warning dialog was showing and user clicked Retry which found the display (exited code 0):
+        if self._warning_proc and self._warning_proc.poll() == 0:
+            logger.info("Warning dialog Retry button detected second display! Triggering immediate wake...")
+            self._warning_proc = None
+            active_displays, _ = self.dm.probe_and_activate_displays()
+            by_name = {d["name"]: d for d in active_displays}
+            for idx, seat in enumerate(seats):
+                sid = seat.get("id", f"seat{idx + 1}")
+                if k.is_sleeping(sid):
+                    if self._wake(idx, seat, auto_ext):
+                        changed = True
 
         for idx, seat in enumerate(seats):
             sid = seat.get("id", f"seat{idx + 1}")
             name = seat.get("display")
             if not name or sid not in owned:
                 continue
-            present = name in by_name
+            present = name in by_name and by_name[name].get("width", 0) > 0
 
             if k.is_sleeping(sid):
-                if not present:
+                # Check if original display or any new second display is present
+                has_display = present or len(active_displays) >= 2
+                if not has_display:
                     self._hit[sid] = 0
                     continue
                 self._hit[sid] = self._hit.get(sid, 0) + 1
@@ -247,38 +271,96 @@ class DisplayGuard:
     # ------------------------------------------------------------------
     def _sleep(self, idx: int, seat: Dict):
         sid = seat.get("id", f"seat{idx + 1}")
-        self._emit(f"😴 Display '{seat.get('display')}' of {sid} disconnected -> {sid} is sleeping "
+        disp_name = seat.get("display", "unknown")
+
+        displays, _ = self.dm.get_displays()
+        active_disp = [d["name"] for d in displays if d.get("width", 0) > 0 and d["name"] != disp_name]
+        active_name = active_disp[0] if active_disp else "Primary Display"
+
+        self._emit(f"😴 Display '{disp_name}' of {sid} disconnected -> {sid} is sleeping "
                    f"(browser closed, input isolated) until it is reconnected.")
         self.kiosk.sleep_seat(sid, seat.get("kiosk_url") or "https://duckduckgo.com",
                               idx, seat.get("lock_kiosk", True))
         if self.engine:
             self.engine.sleep_seat(sid, seat)
 
+        # Show warning dialog with Retry button
+        self._show_warning_dialog(sid, disp_name, active_name)
+
     def _wake(self, idx: int, seat: Dict, auto_ext: bool) -> bool:
         sid = seat.get("id", f"seat{idx + 1}")
+        displays, total = self.dm.probe_and_activate_displays()
+
         name = seat.get("display")
-        displays, total = self.dm.get_displays()
-
-        if auto_ext:
-            saved = self.cfg_mgr.load_config().get("settings", {}).get("display_layout", {})
-            acts = ensure_extended(displays, saved)
-            for a in acts:
-                self._emit(f"🖥 Display settings -> extended mode: {a}")
-            if acts:
-                time.sleep(2.0)
-                displays, total = self.dm.get_displays()
-
         d = next((x for x in displays if x["name"] == name and x.get("width", 0) > 0), None)
+
+        # If original display name not found, automatically assign the newly detected display!
+        if d is None and len(displays) >= 2:
+            cfg = self.cfg_mgr.load_config()
+            all_seats = cfg.get("seats", [])
+            updated_seats, msgs = self.dm.assign_displays_to_seats(all_seats, displays)
+            for m in msgs:
+                self._emit(f"🖥 {m}")
+            cfg["seats"] = updated_seats
+            self.cfg_mgr.save_config(cfg)
+
+            cur_s = next((s for s in updated_seats if s.get("id") == sid), None)
+            if cur_s:
+                seat.clear()
+                seat.update(cur_s)
+                name = seat.get("display")
+                d = next((x for x in displays if x["name"] == name and x.get("width", 0) > 0), None)
+
         if d is None:
-            logger.info(f"Display '{name}' detected but not active yet; will retry.")
+            logger.info(f"Display for '{sid}' detected but not active yet; will retry.")
             return False
 
         if self.engine:
             self.engine.wake_seat(seat, displays, (total["width"], total["height"]))
         ok = self.kiosk.resume_seat(sid, (d["width"], d["height"], d["x"], d["y"]))
-        self._emit(f"▶ Display '{name}' reconnected -> {sid} resumed, browser relaunched."
-                   if ok else f"⚠ Display '{name}' reconnected but relaunching {sid} failed; will retry.")
+        if ok:
+            self._emit(f"▶ Display '{name}' reconnected -> {sid} resumed, second screen launched.")
+            self._dismiss_warning_dialog()
+        else:
+            self._emit(f"⚠ Display '{name}' reconnected but relaunching {sid} failed; will retry.")
         return ok
+
+    # ------------------------------------------------------------------
+    def _show_warning_dialog(self, seat_id: str, disconnected: str, active: str):
+        """Spawns the warning dialog on the active monitor with the Retry button."""
+        if self._warning_proc and self._warning_proc.poll() is None:
+            return
+
+        cmd = [
+            sys.executable, "-m", "gui.display_dialog",
+            "--mode", "warning",
+            "--seat", seat_id,
+            "--disconnected", disconnected,
+            "--active", active,
+        ]
+        try:
+            env = os.environ.copy()
+            env["DISPLAY"] = os.environ.get("DISPLAY", ":0")
+            self._warning_proc = subprocess.Popen(
+                cmd,
+                env=env,
+                start_new_session=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            logger.info(f"Spawned warning dialog process (PID {self._warning_proc.pid}) with Retry button.")
+        except Exception as exc:
+            logger.warning(f"Could not spawn warning dialog: {exc}")
+
+    def _dismiss_warning_dialog(self):
+        """Dismisses the warning dialog process."""
+        if self._warning_proc:
+            try:
+                if self._warning_proc.poll() is None:
+                    self._warning_proc.terminate()
+            except Exception:
+                pass
+            self._warning_proc = None
 
     # ------------------------------------------------------------------
     def _relayout(self, seats: List[Dict]):
@@ -286,8 +368,9 @@ class DisplayGuard:
         displays, total = self.dm.get_displays()
         if not displays:
             return
+        sleeping = set(self.kiosk.sleeping_cfgs.keys())
         if self.engine:
-            self.engine.reconfine_awake(seats, displays, (total["width"], total["height"]))
+            self.engine.reconfine_awake(seats, displays, (total["width"], total["height"]), sleeping_seats=sleeping)
         by_name = {d["name"]: d for d in displays}
         for seat in seats:
             sid = seat.get("id")

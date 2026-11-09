@@ -45,6 +45,81 @@ class DeviceManager:
     # -----------------------------------------------------------------------
     # Display Discovery
     # -----------------------------------------------------------------------
+    # -----------------------------------------------------------------------
+    # Display Discovery & Auto-Assignment
+    # -----------------------------------------------------------------------
+    def probe_and_activate_displays(self) -> Tuple[List[Dict], Dict[str, int]]:
+        """
+        Forces a hardware re-probe of displays via xrandr/DRM, activates any connected
+        but unconfigured or mirrored displays (via ensure_extended), and returns
+        (active_displays, total_canvas).
+        """
+        displays, total = self.get_displays()
+        try:
+            from core.display_guard import ensure_extended
+            from core.config_manager import ConfigManager
+            import time
+            saved = ConfigManager().load_config().get("settings", {}).get("display_layout", {})
+            acts = ensure_extended(displays, saved)
+            if acts:
+                time.sleep(0.3)
+        except Exception as exc:
+            logger.debug(f"ensure_extended notice: {exc}")
+
+        # Re-query after xrandr updates
+        displays, total = self.get_displays()
+        active = [d for d in displays if d.get("connected", True) and d.get("width", 0) > 0]
+        return active, total
+
+    def assign_displays_to_seats(self, seats: List[Dict], displays: List[Dict]) -> Tuple[List[Dict], List[str]]:
+        """
+        Assigns active displays to seats respecting preferences (locked_display, primary)
+        and priority rules. Returns (updated_seats, log_messages).
+        """
+        active = [d for d in displays if d.get("connected", True) and d.get("width", 0) > 0]
+        if not active:
+            return seats, ["No active displays found to assign."]
+
+        messages = []
+        disp_names = [d["name"] for d in active]
+        assigned_displays = set()
+        updated_seats = [dict(s) for s in seats]
+
+        # Phase 1: Preference for locked_display match
+        for s in updated_seats:
+            sid = s.get("id", "seat")
+            pref = s.get("locked_display")
+            if pref and pref in disp_names and pref not in assigned_displays:
+                s["display"] = pref
+                assigned_displays.add(pref)
+                messages.append(f"{sid}: Retained preferred locked display '{pref}'")
+
+        # Phase 2: Preserve current seat['display'] if active and unassigned
+        for s in updated_seats:
+            sid = s.get("id", "seat")
+            cur = s.get("display")
+            if cur and cur in disp_names and cur not in assigned_displays:
+                s["display"] = cur
+                assigned_displays.add(cur)
+
+        # Phase 3: Fill unassigned seats from remaining connected displays
+        rem_displays = [d for d in active if d["name"] not in assigned_displays]
+        rem_displays.sort(key=lambda d: (not d.get("primary", False), d.get("x", 0)))
+
+        for s in updated_seats:
+            sid = s.get("id", "seat")
+            if s.get("display") not in disp_names or s.get("display") in (assigned_displays - {s.get("display")}):
+                if rem_displays:
+                    chosen = rem_displays.pop(0)
+                    old_disp = s.get("display")
+                    s["display"] = chosen["name"]
+                    assigned_displays.add(chosen["name"])
+                    messages.append(f"{sid}: Automatically assigned newly detected display '{chosen['name']}' (was '{old_disp}')")
+                    if not s.get("locked_display"):
+                        s["locked_display"] = chosen["name"]
+
+        return updated_seats, messages
+
     def get_displays(self):
         """
         Discovers connected video displays using xrandr, falling back to sysfs DRM.

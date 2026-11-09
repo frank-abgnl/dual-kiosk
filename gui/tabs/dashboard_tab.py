@@ -201,57 +201,30 @@ class DashboardTab(Gtk.Box):
     # -----------------------------------------------------------------------
     def _on_start_all(self, _btn):
         self.append_log("Starting pseudo-seating and launching dual Firefox kiosks...")
-        self.app.show_info("Applying seat mappings and launching kiosks...", 0)
+        self.app.show_info("Checking display hardware and applying seat mappings...", 0)
 
         def _worker():
-            cfg = self.app.config_mgr.load_config()
-            seats = cfg.get("seats", [])
-            displays, total_screen = self.app.device_mgr.get_displays()
-
-            # 1. Apply XInput seat configuration
-            self.append_log("Applying XInput MPX master pairs & device reattachments...")
-            results = self.app.seating_engine.apply_seating(seats, displays, (total_screen["width"], total_screen["height"]))
-            self.append_log(f"XInput mapping results: {results}")
-            if hasattr(self.app, 'hotkey_mgr') and self.app.hotkey_mgr:
-                self.app.hotkey_mgr.update_seat_keyboards(self.app.seating_engine.seat_keyboards)
-
-            # 2. Launch Firefox kiosks
-            self.append_log("Launching dual Firefox kiosks with isolated profiles...")
-            s1_url = seats[0].get("kiosk_url", "https://duckduckgo.com") if len(seats) > 0 else "https://duckduckgo.com"
-            s2_url = seats[1].get("kiosk_url", "https://www.google.com") if len(seats) > 1 else "https://www.google.com"
-
-            ok = self.app.kiosk_mgr.launch_dual_kiosks(
-                seat1_url=s1_url,
-                seat2_url=s2_url,
-                displays_info=displays,
-                enforce_lock=True,
-            )
-
+            from core.session_manager import session_mgr
+            ok, msg = session_mgr.start_session(on_event=lambda m: self.append_log(m))
             if ok:
-                self.append_log("Dual Firefox kiosks launched successfully in kiosk mode.")
+                self.append_log("Dual Firefox kiosks launched successfully.")
                 self.append_log("⚡ Super Shortcut active: Press Ctrl + Shift + M + S on any seat to overlay control panel on your screen.")
                 GLib.idle_add(self.app.show_info, "Pseudo-seating active! Dual Firefox kiosks running (Ctrl+Shift+M+S to overlay).", 0)
             else:
-                self.append_log("Warning: One or more Firefox kiosks failed to launch.")
-                GLib.idle_add(self.app.show_info, "Check logs: Firefox launch issue.", 1)
+                self.append_log(f"Start notice: {msg}")
+                GLib.idle_add(self.app.show_info, msg, 1)
 
             GLib.idle_add(self.refresh_metrics)
 
         threading.Thread(target=_worker, daemon=True).start()
 
     def _on_stop_all(self, _btn):
-        self.append_log("Stopping all kiosks and resetting XInput devices...")
+        self.append_log("Stopping all kiosks, background supervisors, and resetting XInput devices...")
         self.app.show_info("Stopping kiosks and resetting devices...", 0)
 
         def _worker():
-            # 1. Stop kiosks
-            self.app.kiosk_mgr.stop_all_kiosks()
-            self.append_log("All Firefox kiosk instances terminated.")
-
-            # 2. Reset XInput
-            self.app.seating_engine.reset_all_to_core()
-            self.append_log("All pointers/keyboards reattached to Virtual core.")
-
+            from core.session_manager import session_mgr
+            session_mgr.stop_session(exit_gui=False, on_event=lambda m: self.append_log(m))
             GLib.idle_add(self.app.show_info, "All seats stopped. System restored to single-seat core.", 0)
             GLib.idle_add(self.refresh_metrics)
 
@@ -260,14 +233,8 @@ class DashboardTab(Gtk.Box):
     def _on_restart_kiosks(self, _btn):
         self.append_log("Restarting Firefox kiosks...")
         def _worker():
-            cfg = self.app.config_mgr.load_config()
-            seats = cfg.get("seats", [])
-            displays, _ = self.app.device_mgr.get_displays()
-            s1_url = seats[0].get("kiosk_url", "https://duckduckgo.com") if len(seats) > 0 else "https://duckduckgo.com"
-            s2_url = seats[1].get("kiosk_url", "https://www.google.com") if len(seats) > 1 else "https://www.google.com"
-            self.app.kiosk_mgr.stop_all_kiosks()
-            time.sleep(0.5)
-            self.app.kiosk_mgr.launch_dual_kiosks(s1_url, s2_url, displays, enforce_lock=True)
+            from core.session_manager import session_mgr
+            session_mgr.restart_session(on_event=lambda m: self.append_log(m))
             self.append_log("Dual kiosks restarted.")
             GLib.idle_add(self.refresh_metrics)
         threading.Thread(target=_worker, daemon=True).start()

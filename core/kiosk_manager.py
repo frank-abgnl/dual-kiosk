@@ -44,6 +44,7 @@ class KioskManager:
         self.running_processes: Dict[str, subprocess.Popen] = {}
         self.window_ids: Dict[str, str] = {}
         self.kiosk_configs: Dict[str, Dict] = {}
+        self.sleeping_cfgs: Dict[str, Dict] = {}
         self._watchdog_thread: Optional[threading.Thread] = None
         self._stop_watchdog = threading.Event()
         self._lock = threading.Lock()
@@ -336,7 +337,7 @@ user_pref("app.update.enabled", false);
             time.sleep(interval_sec)
 
             with self._lock:
-                active_seats = list(self.kiosk_configs.keys())
+                active_seats = [s for s in self.kiosk_configs.keys() if s not in self.sleeping_cfgs]
 
             for seat_id in active_seats:
                 if self._stop_watchdog.is_set():
@@ -426,15 +427,64 @@ user_pref("app.update.enabled", false);
 
         return ok1 and ok2
 
+    def is_sleeping(self, seat_id: str) -> bool:
+        with self._lock:
+            return seat_id in self.sleeping_cfgs
+
+    def sleep_seat(
+        self,
+        seat_id: str,
+        kiosk_url: str = "https://duckduckgo.com",
+        monitor_index: int = 0,
+        lock_kiosk: bool = True,
+    ):
+        """Puts a seat to sleep when its monitor disconnects (stops browser, records config)."""
+        with self._lock:
+            cur = self.kiosk_configs.get(seat_id, {})
+            self.sleeping_cfgs[seat_id] = {
+                "kiosk_url": cur.get("kiosk_url", kiosk_url),
+                "monitor_index": cur.get("monitor_index", monitor_index),
+                "enforce_lock": cur.get("enforce_lock", lock_kiosk),
+            }
+            logger.info(f"Kiosk for seat '{seat_id}' is sleeping (display disconnected). Terminating browser instance.")
+            self._terminate_seat_process(seat_id)
+
+    def resume_seat(
+        self,
+        seat_id: str,
+        display_geometry: Optional[Tuple[int, int, int, int]] = None,
+    ) -> bool:
+        """Resumes a sleeping seat on its reconnected monitor and relaunches the kiosk."""
+        with self._lock:
+            cfg = self.sleeping_cfgs.pop(seat_id, None) or self.kiosk_configs.get(seat_id, {})
+        url = cfg.get("kiosk_url", "https://duckduckgo.com")
+        mon = cfg.get("monitor_index", 1 if seat_id == "seat2" else 0)
+        lock = cfg.get("enforce_lock", True)
+        logger.info(f"Resuming seat '{seat_id}' on geometry {display_geometry} (URL: {url})...")
+        return self.launch_kiosk(seat_id, url, monitor_index=mon, display_geometry=display_geometry, enforce_lock=lock)
+
     def stop_all_kiosks(self):
-        """Stops all running kiosk instances and shuts down the watchdog."""
+        """Stops all running kiosk instances (both in-process and system-wide) and shuts down the watchdog."""
         self.stop_watchdog()
         with self._lock:
             seats = list(self.running_processes.keys())
             for seat_id in seats:
                 self._terminate_seat_process(seat_id)
             self.kiosk_configs.clear()
+            self.sleeping_cfgs.clear()
             self.window_ids.clear()
+
+        # System-wide termination of any external Firefox kiosks using our profiles
+        try:
+            from core.uninstaller import Uninstaller
+            u = Uninstaller()
+            external_pids = u.find_kiosks()
+            if external_pids:
+                logger.info(f"Terminating external kiosk processes: {external_pids}")
+                u._terminate(external_pids, "kiosk browsers")
+        except Exception as exc:
+            logger.debug(f"External kiosk cleanup notice: {exc}")
+
         logger.info("All kiosk instances stopped.")
 
     # -----------------------------------------------------------------------

@@ -84,11 +84,11 @@ class Uninstaller:
             if pid == me or "python" not in os.path.basename(argv[0]):
                 continue
             for a in argv[1:]:
-                if not a.endswith("main.py"):
+                if not (a.endswith("main.py") or a.endswith("launcher.py")):
                     continue
                 p = Path(a) if os.path.isabs(a) else Path(cwd) / a
                 try:
-                    if p.resolve() == MAIN_PY:
+                    if p.name in ("main.py", "launcher.py"):
                         found.append(pid)
                         break
                 except OSError:

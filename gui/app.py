@@ -88,6 +88,12 @@ class XInputMultiseatApp(Gtk.ApplicationWindow):
         self.btn_hide_overlay.set_no_show_all(True)
         hb.pack_end(self.btn_hide_overlay)
 
+        self.btn_quit_app = Gtk.Button(label="🛑  Stop & Exit App")
+        self.btn_quit_app.get_style_context().add_class("btn-danger")
+        self.btn_quit_app.set_tooltip_text("Terminate supervisor and all kiosks, restore desktop input, and close application")
+        self.btn_quit_app.connect("clicked", lambda _: self._confirm_and_quit_app())
+        hb.pack_end(self.btn_quit_app)
+
         self.lbl_overlay_badge = Gtk.Label(label="")
         self.lbl_overlay_badge.set_no_show_all(True)
         hb.pack_end(self.lbl_overlay_badge)
@@ -175,6 +181,14 @@ class XInputMultiseatApp(Gtk.ApplicationWindow):
             GLib.idle_add(self.hide_overlay)
         elif cmd == "TOGGLE":
             GLib.idle_add(self.toggle_overlay, seat_id)
+        elif cmd in ("STOP", "QUIT", "CLOSE"):
+            GLib.idle_add(self._on_ipc_stop)
+
+    def _on_ipc_stop(self):
+        logger.info("Received IPC STOP/QUIT command. Closing Control Board...")
+        self.destroy()
+        if Gtk.main_level() > 0:
+            Gtk.main_quit()
 
     def _on_hotkey_triggered(self, seat_id: str, _master_id: int, _slave_id: int):
         """Callback from background XInput2 listener when Ctrl+Shift+M+S is hit."""
@@ -228,16 +242,75 @@ class XInputMultiseatApp(Gtk.ApplicationWindow):
             return True
         return False
 
+    def _confirm_and_quit_app(self):
+        """Asks user confirmation to stop kiosks, supervisor, and close the Control Board."""
+        from core.session_manager import session_mgr
+        if session_mgr.is_session_active():
+            dlg = Gtk.MessageDialog(
+                transient_for=self,
+                modal=True,
+                message_type=Gtk.MessageType.WARNING,
+                buttons=Gtk.ButtonsType.NONE,
+                text="Stop All Kiosks & Exit Application?",
+            )
+            dlg.format_secondary_text(
+                "This will terminate all running kiosk browsers, stop the background supervisor, "
+                "reattach all input devices to the normal desktop, and close the Control Board."
+            )
+            dlg.add_button("Cancel", Gtk.ResponseType.CANCEL)
+            btn_stop = dlg.add_button("🛑  Stop All & Exit", Gtk.ResponseType.OK)
+            btn_stop.get_style_context().add_class("btn-danger")
+            resp = dlg.run()
+            dlg.destroy()
+            if resp != Gtk.ResponseType.OK:
+                return
+
+        self._stop_and_exit_app()
+
+    def _stop_and_exit_app(self):
+        """Unified shutdown: stops supervisor, kiosks, devices, and closes GUI."""
+        from core.session_manager import session_mgr
+        logger.info("Executing unified shutdown from Control Board...")
+        session_mgr.stop_session(exit_gui=True)
+        self.destroy()
+        if Gtk.main_level() > 0:
+            Gtk.main_quit()
+
     def _on_delete_event(self, _widget, _event):
         """
-        When kiosks are active, clicking the close button 'X' hides the overlay
-        back into kiosk mode rather than killing the entire application.
+        When kiosks are active, prompt the user whether to hide the overlay,
+        stop kiosks and exit completely, or cancel.
         """
-        if self.kiosk_mgr.is_any_kiosk_running():
-            logger.info("Close button clicked while kiosks active. Hiding overlay.")
-            self.hide_overlay()
-            return True  # Prevent window destruction
-        return False  # Allow clean shutdown
+        from core.session_manager import session_mgr
+        if session_mgr.is_session_active():
+            dlg = Gtk.MessageDialog(
+                transient_for=self,
+                modal=True,
+                message_type=Gtk.MessageType.QUESTION,
+                buttons=Gtk.ButtonsType.NONE,
+                text="Kiosk Session Active",
+            )
+            dlg.format_secondary_text(
+                "Dual Firefox kiosks are currently running.\n\n"
+                "What would you like to do?"
+            )
+            dlg.add_button("Cancel", Gtk.ResponseType.CANCEL)
+            dlg.add_button("⬇  Hide to Kiosk", 1)
+            btn_stop = dlg.add_button("🛑  Stop Kiosks & Exit", 2)
+            btn_stop.get_style_context().add_class("btn-danger")
+
+            resp = dlg.run()
+            dlg.destroy()
+
+            if resp == 1:
+                self.hide_overlay()
+                return True
+            elif resp == 2:
+                self._stop_and_exit_app()
+                return False
+            else:
+                return True  # Cancelled
+        return False  # Allow clean shutdown when no kiosks running
 
     # -----------------------------------------------------------------------
     # Overlay Mode Presentation & Seat Focus
@@ -479,6 +552,9 @@ class XInputMultiseatApp(Gtk.ApplicationWindow):
             self.hotkey_mgr.stop()
         if hasattr(self, 'ipc_server') and self.ipc_server:
             self.ipc_server.stop()
+        if hasattr(self, 'display_guard') and self.display_guard:
+            self.display_guard.stop()
+            self.display_guard = None
         self.kiosk_mgr.stop_watchdog()
         if Gtk.main_level() > 0:
             Gtk.main_quit()

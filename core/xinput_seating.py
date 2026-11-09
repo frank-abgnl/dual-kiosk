@@ -636,3 +636,93 @@ class XInputSeatingEngine:
             self._verified_sig = sig
             self._attempts.clear()
         return msgs
+
+    # -----------------------------------------------------------------------
+    # Display Disconnect & Sleep / Wake Handling
+    # -----------------------------------------------------------------------
+    def sleep_seat(self, seat_id: str, seat_config: Optional[Dict] = None):
+        """
+        Isolates input for a seat whose monitor disconnected.
+        Floats the slave devices so clicks/keystrokes cannot bleed into active seats.
+        Releases pointer confinement barriers.
+        """
+        logger.info(f"Putting seat '{seat_id}' input to sleep (releasing barrier, isolating devices)...")
+        # 1. Release barrier
+        master_ptr = self.seat_pointers.get(seat_id)
+        if isinstance(master_ptr, int):
+            self.confiner.release(master_ptr)
+
+        # 2. Float input devices
+        if seat_config:
+            m_id = seat_config.get("mouse_id")
+            k_id = seat_config.get("keyboard_id")
+            for dev_id in (m_id, k_id):
+                if dev_id and isinstance(dev_id, int):
+                    run_command(["xinput", "float", str(dev_id)])
+
+    def wake_seat(self, seat_config: Dict, displays_info: List[Dict], total_screen: Optional[Tuple[int, int]] = None):
+        """
+        Restores seating for a reconnected seat:
+        - Resolves live devices using PeripheralResolver priority rules
+        - Reattaches slave pointer/keyboard to this seat's master
+        - Confines master pointer to the monitor
+        """
+        sid = seat_config.get("id", "seat2")
+        is_primary = seat_config.get("is_primary", False)
+        dname = seat_config.get("display")
+        logger.info(f"Waking seat '{sid}' on display '{dname}'...")
+
+        # Re-resolve live devices
+        resolved, assignments = self.resolve_live([seat_config])
+        if resolved:
+            seat_config = resolved[0]
+
+        master_ptr = self.CORE_POINTER_ID if is_primary else self.seat_pointers.get(sid)
+        master_kbd = self.CORE_KEYBOARD_ID if is_primary else self.seat_keyboards.get(sid)
+
+        if not master_ptr or not master_kbd:
+            if not is_primary:
+                ptr_id, kbd_id = self.create_master_pair(f"Seat_{sid.upper()}")
+                master_ptr = ptr_id or master_ptr
+                master_kbd = kbd_id or master_kbd
+                if ptr_id:
+                    self.seat_pointers[sid] = ptr_id
+                if kbd_id:
+                    self.seat_keyboards[sid] = kbd_id
+
+        m_id = seat_config.get("mouse_id")
+        k_id = seat_config.get("keyboard_id")
+
+        if m_id and master_ptr:
+            self.attach_with_siblings(m_id, master_ptr, "pointer")
+            if dname:
+                self.map_pointer_to_output(m_id, dname)
+
+        if k_id and master_kbd:
+            self.attach_with_siblings(k_id, master_kbd, "keyboard")
+            if not is_primary:
+                self.copy_keyboard_layout(master_kbd)
+
+        # Reconfine master pointer to restored display
+        disp_map = {d["name"]: d for d in displays_info if d.get("width", 0) > 0}
+        d = disp_map.get(dname)
+        if isinstance(master_ptr, int) and d and d.get("width") and d.get("height"):
+            geom = (d["width"], d["height"], d["x"], d["y"])
+            self.confine_master(master_ptr, geom, total_screen)
+
+    def reconfine_awake(self, seats: List[Dict], displays_info: List[Dict], total_screen: Optional[Tuple[int, int]] = None,
+                        sleeping_seats: Optional[set] = None):
+        """Re-confines all awake seats to their respective monitors."""
+        sleeping = sleeping_seats or set()
+        disp_map = {d["name"]: d for d in displays_info if d.get("width", 0) > 0}
+        for seat in seats:
+            sid = seat.get("id")
+            if sid in sleeping:
+                continue
+            master_ptr = self.CORE_POINTER_ID if seat.get("is_primary") else self.seat_pointers.get(sid)
+            dname = seat.get("display")
+            d = disp_map.get(dname)
+            if isinstance(master_ptr, int) and d and d.get("width") and d.get("height"):
+                geom = (d["width"], d["height"], d["x"], d["y"])
+                self.confine_master(master_ptr, geom, total_screen)
+
