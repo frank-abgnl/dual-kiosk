@@ -2,16 +2,17 @@
 """
 One-click Kiosk Launcher (use from a desktop / menu shortcut instead of autostart).
 
-    launch.sh                 detect hardware -> assign seats -> save config -> launch kiosks
+    launch.sh                 detect hardware -> assign seats -> save config -> launch kiosks & GUI
     launch.sh --reassign      forget saved seat assignment and detect from scratch (restarts)
     launch.sh --restart       stop a running session first, then launch again
     launch.sh --no-detect     launch with the saved config only
     launch.sh --reseat        re-seat all devices of a running session (same as Ctrl+Shift+M+R)
     launch.sh --reseat --hard ... and restart the browsers too
-    launch.sh --stop          stop kiosks, reset input devices to Virtual core
+    launch.sh --stop          stop kiosks, close GUI, reset input devices to Virtual core
     launch.sh --control-board show the Control Board (also what a second click on the shortcut does)
 
-The process stays alive as the supervisor (watchdog, shield, hotplug handling, hotkey).
+The process stays alive as the supervisor (watchdog, shield, hotplug handling, hotkey)
+and binds its lifecycle with the Control Board GUI.
 """
 
 import argparse
@@ -70,12 +71,19 @@ def _read_pid():
         return None
 
 
-def spawn_control_board(seat: str):
+def spawn_control_board(seat: str, start_hidden: bool = False):
     env = os.environ.copy()
     env.pop("WAYLAND_DISPLAY", None)
-    subprocess.Popen([sys.executable, str(PROJECT_DIR / "main.py"), "--overlay", "--seat", seat],
-                     env=env, start_new_session=True,
-                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    cmd = [sys.executable, str(PROJECT_DIR / "main.py"), "--seat", seat]
+    if not start_hidden:
+        cmd.append("--overlay")
+    return subprocess.Popen(
+        cmd,
+        env=env,
+        start_new_session=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
 
 
 def cmd_control_board(seat: str) -> int:
@@ -93,7 +101,7 @@ def emergency_cleanup():
 
 def cmd_stop() -> int:
     from core.session_manager import session_mgr
-    session_mgr.stop_session(on_event=notify)
+    session_mgr.stop_session(exit_gui=True, on_event=notify)
     notify("Kiosks stopped, input devices returned to the normal desktop.")
     return 0
 
@@ -117,57 +125,12 @@ def acquire_lock():
         return None
 
 
-def wait_for_display(dm, timeout=30):
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        displays, total = dm.get_displays()
-        if any(d.get("active") and d.get("width", 0) > 0 for d in displays):
-            return displays, total
-        time.sleep(1)
-    return dm.get_displays()
-
-
-def detect_and_assign(cfg_mgr, dm, engine, reassign: bool):
-    """Detects displays + peripherals, assigns them to seats and saves the result."""
-    cfg = cfg_mgr.load_config() if cfg_mgr.config_path.exists() else {}
-    seats = cfg.get("seats") or []
-    has_memory = len(seats) >= 2 and any(s.get("mouse_name") or s.get("keyboard_name") for s in seats[:2])
-
-    if reassign or not has_memory:
-        log.info("Detecting hardware and assigning seats from scratch...")
-        cfg = cfg_mgr.auto_generate_config(dm, force_reassign=True)
-    else:
-        log.info("Using the saved seat assignment (peripherals matched by name / USB identity)...")
-
-    # A saved output name that no longer exists (e.g. renamed connector) -> map seats by monitor order
-    displays, _ = dm.get_displays()
-    names = [d["name"] for d in displays]
-    for i, s in enumerate(cfg["seats"][:2]):
-        if names and s.get("display") not in names:
-            new = names[min(i, len(names) - 1)]
-            log.warning(f"{s.get('id')}: display {s.get('display')!r} not found, using {new!r}")
-            s["display"] = new
-            s["locked_display"] = new
-
-    resolved, assignments = engine.resolve_live(cfg["seats"])
-    for s in resolved:  # persist stable identity, drop transient flags
-        s.pop("pointer_connected", None)
-        s.pop("keyboard_connected", None)
-    cfg["seats"] = resolved
-    cfg_mgr.save_config(cfg)
-
-    for (sid, cls), dev in sorted(assignments.items()):
-        seat = next((x for x in cfg["seats"] if x.get("id") == sid), {})
-        log.info(f"  {sid} {cls}: " + (f"{dev['name']} (ID {dev['id']})" if dev else "not connected")
-                 + f"   display={seat.get('display')}")
-    return cfg
-
-
 def launch(args) -> int:
     missing = [c for c in REQUIRED if not shutil.which(c)]
     if missing:
         notify(f"Missing tools: {', '.join(missing)}. Install them and try again.", urgent=True)
         return 1
+
     if not os.environ.get("DISPLAY"):
         os.environ["DISPLAY"] = ":0"
 
@@ -180,140 +143,56 @@ def launch(args) -> int:
     if lock is None:
         notify("Kiosks are already running - opening the Control Board.")
         return cmd_control_board(args.seat)
-    PID_FILE.write_text(str(os.getpid()))
 
-    from core.combo_hotkey import ComboHotkey
-    from core.config_manager import ConfigManager
-    from core.device_manager import DeviceManager
+    from core.session_manager import session_mgr
     from core.hotkey_manager import HotkeyManager, send_overlay_command
-    from core.kiosk_manager import KioskManager
-    from core.xinput_seating import XInputSeatingEngine
-
-    dm, cfg_mgr, engine, kiosk = DeviceManager(), ConfigManager(), XInputSeatingEngine(), KioskManager()
-    kiosk.on_window_ready = engine.focus_seat_keyboard
-    kiosk.engine = engine
 
     stop = threading.Event()
     for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
         signal.signal(sig, lambda *_: stop.set())
-    reseat_req = threading.Event()
-    reseat_hard = [False]
 
-    def request_reseat(hard=False):
-        reseat_hard[0] = reseat_hard[0] or hard
-        reseat_req.set()
+    signal.signal(signal.SIGUSR1, lambda *_: session_mgr.reseat_session(hard=False, on_event=notify))
+    signal.signal(signal.SIGUSR2, lambda *_: session_mgr.reseat_session(hard=True, on_event=notify))
 
-    signal.signal(signal.SIGUSR1, lambda *_: request_reseat(False))
-    signal.signal(signal.SIGUSR2, lambda *_: request_reseat(True))
-
-    hotkey = reseat_key = display_guard = None
+    gui_proc = None
     try:
-        notify("Detecting displays and input devices...")
-        emergency_cleanup()  # clean slate: no stale masters, kiosks or barriers
-        displays, total = wait_for_display(dm)
-        if not displays:
-            notify("No display detected.", urgent=True)
+        ok, msg = session_mgr.start_session(
+            reassign=args.reassign,
+            no_detect=args.no_detect,
+            on_event=notify,
+        )
+        if not ok:
+            notify(msg, urgent=True)
             return 1
 
-        # Automatic display detection: Require at least 2 displays
-        active_disp, total = dm.probe_and_activate_displays()
-        if len(active_disp) < 2:
-            log.warning(f"Only {len(active_disp)} display detected at startup. Dual kiosk requires at least 2.")
-            notify("Only one display detected. Waiting for second monitor to be connected...", urgent=True)
-            from gui.display_dialog import run_single_display_error_modal
-            ok_retry, new_disp = run_single_display_error_modal(active_disp)
-            if not ok_retry or not new_disp or len(new_disp) < 2:
-                log.info("Display error dialog cancelled or second display not found. Launch aborted.")
-                notify("Launch aborted: Dual kiosks require two connected displays.")
-                return 1
-            displays = new_disp
-            total = dm.get_displays()[1]
-        else:
-            displays = active_disp
+        # Bind GUI startup: spawn the Control Board GUI alongside the desktop session
+        if not send_overlay_command("NOP"):
+            gui_proc = spawn_control_board(args.seat, start_hidden=True)
 
-        cfg = args.no_detect and cfg_mgr.load_config() or detect_and_assign(cfg_mgr, dm, engine, args.reassign)
-        seats = cfg.get("seats", [])
-
-        # Automatically assign displays to seats respecting preferences and priority rules
-        seats, assign_msgs = dm.assign_displays_to_seats(seats, displays)
-        for m in assign_msgs:
-            log.info(f"[Display Assignment] {m}")
-        cfg["seats"] = seats
-        cfg_mgr.save_config(cfg)
-
-        results = engine.apply_seating(seats, displays, (total["width"], total["height"]))
-        log.info(f"Seating applied: {results}")
-
-        def launch_kiosks(seats, displays):
-            urls = [s.get("kiosk_url") for s in seats[:2]] + [None, None]
-            return kiosk.launch_dual_kiosks(urls[0] or "https://duckduckgo.com",
-                                            urls[1] or "https://www.google.com", displays, enforce_lock=True)
-
-        ok = launch_kiosks(seats, displays)
         notify("Kiosks running. Ctrl+Shift+M+S opens the Control Board." if ok
                else "A kiosk failed to start - see ~/.config/xinput-seats/launcher.log", urgent=not ok)
 
-        # Start DisplayGuard to monitor runtime display disconnects and handle Retry
-        from core.display_guard import DisplayGuard
-        display_guard = DisplayGuard(kiosk, engine, interval=1.2, on_event=notify)
-        display_guard.start()
-
         gui_until = [0.0]
-
         def on_hotkey(seat_id, _master, _slave):
-            # The overlay GUI listens to the same hotkey itself; only start it if it is not running.
-            if send_overlay_command("NOP"):  # socket answers -> GUI alive, it toggles itself
+            if send_overlay_command("NOP"):
                 return
             if time.time() > gui_until[0]:
                 gui_until[0] = time.time() + 8
                 spawn_control_board(seat_id)
 
-        hotkey = HotkeyManager(on_trigger=on_hotkey, seat_keyboards=engine.seat_keyboards)
-        hotkey.start()
-        # Ctrl+Shift+M+R: re-seat everything without opening the GUI (handled by the main loop below)
-        reseat_key = ComboHotkey("r", lambda *_: request_reseat(False),
-                                 seat_keyboards=engine.seat_keyboards, name="reseat")
-        reseat_key.start()
-
-        def do_reseat(hard: bool):
-            """Soft: reset + reassign devices, browsers keep running. Hard: browsers restart too."""
-            try:
-                send_overlay_command("HIDE")  # never leave the Control Board in the way
-                alive = (len(kiosk.running_processes) >= 2
-                         and all(p.poll() is None for p in kiosk.running_processes.values()))
-                hard = hard or not alive
-                notify("Re-seating all seats" + (" and restarting the browsers..." if hard else "..."))
-                if hard:
-                    kiosk.stop_all_kiosks()
-                engine.reset_all_to_core()
-                displays_now, total_now = dm.get_displays()
-                cfg_now = detect_and_assign(cfg_mgr, dm, engine, False)
-                seats_now = cfg_now.get("seats", [])
-                res = engine.apply_seating(seats_now, displays_now, (total_now["width"], total_now["height"]))
-                log.info(f"Re-seat result: {res}")
-                hotkey.update_seat_keyboards(engine.seat_keyboards)
-                reseat_key.update_seat_keyboards(engine.seat_keyboards)
-                if hard:
-                    launch_kiosks(seats_now, displays_now)
-                else:  # rebind each browser to its seat's (new) master pointer + keyboard
-                    for sid, win in list(kiosk.window_ids.items()):
-                        engine.focus_seat_keyboard(sid, win)
-                notify("Seats re-assigned.")
-            except Exception as exc:
-                log.exception("Re-seat failed")
-                notify(f"Re-seat failed: {exc} (try launch.sh --reseat --hard)", urgent=True)
+        session_mgr.hotkey_mgr = HotkeyManager(on_trigger=on_hotkey, seat_keyboards=session_mgr.engine.seat_keyboards)
+        session_mgr.hotkey_mgr.start()
 
         last_hotplug = 0.0
         while not stop.wait(0.4):
-            if reseat_req.is_set():
-                hard = reseat_hard[0]
-                reseat_req.clear()
-                reseat_hard[0] = False
-                do_reseat(hard)
-                continue
+            if gui_proc is not None and gui_proc.poll() is not None:
+                log.info("Bound Control Board GUI exited; stopping desktop session.")
+                break
             if time.time() - last_hotplug >= 1.5:
                 last_hotplug = time.time()
-                for msg in engine.check_and_reseat_hotplugged_devices(cfg_mgr.load_config().get("seats", [])):
+                for msg in session_mgr.engine.check_and_reseat_hotplugged_devices(
+                    session_mgr.cfg_mgr.load_config().get("seats", [])
+                ):
                     notify(msg)
         return 0
     except Exception as exc:
@@ -322,8 +201,7 @@ def launch(args) -> int:
         return 1
     finally:
         log.info("Shutting down launcher session...")
-        from core.session_manager import session_mgr
-        session_mgr.stop_session(on_event=log.info)
+        session_mgr.stop_session(exit_gui=True, on_event=log.info)
 
 
 def main():
@@ -337,6 +215,7 @@ def main():
     ap.add_argument("--control-board", action="store_true", help="show the Control Board")
     ap.add_argument("--seat", default="seat1", help="seat for --control-board (default seat1)")
     args = ap.parse_args()
+
     if args.stop:
         sys.exit(cmd_stop())
     if args.reseat:

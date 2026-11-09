@@ -16,10 +16,7 @@ from pathlib import Path
 from typing import Optional
 
 from core import overlay_state
-from core.device_manager import DeviceManager
-from core.xinput_seating import XInputSeatingEngine
-from core.kiosk_manager import KioskManager
-from core.config_manager import ConfigManager
+from core.session_manager import session_mgr
 from core.hotkey_manager import HotkeyManager, OverlayIPCServer, get_seat_screen_geometry
 from gui.styles import CSS_STYLES
 from gui.tabs import DashboardTab, SeatsTab, DevicesTab, TestTab, ConfigTab
@@ -156,13 +153,38 @@ class XInputMultiseatApp(Gtk.ApplicationWindow):
         self.connect("delete-event", self._on_delete_event)
         self.connect("key-press-event", self._on_key_press)
 
-        # First run check
-        if not self.config_mgr.config_path.exists():
-            GLib.idle_add(self._show_setup_wizard)
-
-        # If launched directly in overlay mode
+        # Bind GUI startup with Desktop/Kiosk session startup
         if overlay_mode:
-            GLib.idle_add(self.show_overlay, target_seat)
+            if not session_mgr.is_session_active():
+                GLib.idle_add(self._auto_start_kiosks_on_launch, True, target_seat)
+            else:
+                GLib.idle_add(self.show_overlay, target_seat)
+        elif self._auto_start_session:
+            GLib.idle_add(self._auto_start_kiosks_on_launch, False, target_seat)
+
+    def _auto_start_kiosks_on_launch(self, show_overlay_after: bool = False, target_seat: str = "seat1"):
+        """Starts the desktop seating & kiosk session automatically when the GUI starts if not already active."""
+        if not session_mgr.is_session_active():
+            self.dashboard_tab.append_log("Auto-starting seating and dual Firefox kiosks with GUI startup...")
+            def _worker():
+                ok, msg = session_mgr.start_session(on_event=lambda m: self.dashboard_tab.append_log(m))
+                if ok:
+                    GLib.idle_add(self.hotkey_mgr.update_seat_keyboards, self.seating_engine.seat_keyboards)
+                    GLib.idle_add(self.show_info, "Pseudo-seating active! Dual Firefox kiosks running.", 0)
+                    if show_overlay_after:
+                        GLib.idle_add(self.show_overlay, target_seat)
+                    else:
+                        GLib.idle_add(self.iconify)
+                else:
+                    GLib.idle_add(self.show_info, msg, 1)
+                GLib.idle_add(self.refresh_all)
+            threading.Thread(target=_worker, daemon=True).start()
+        else:
+            self._ensure_masters()
+            if self.seating_engine.seat_keyboards:
+                self.hotkey_mgr.update_seat_keyboards(self.seating_engine.seat_keyboards)
+            self.refresh_all()
+        return False
 
     # -----------------------------------------------------------------------
     # Global Hotkey & Overlay IPC Handlers
@@ -185,6 +207,7 @@ class XInputMultiseatApp(Gtk.ApplicationWindow):
             GLib.idle_add(self._on_ipc_stop)
 
     def _on_ipc_stop(self):
+        self._shutting_down = True
         logger.info("Received IPC STOP/QUIT command. Closing Control Board...")
         self.destroy()
         if Gtk.main_level() > 0:
@@ -269,7 +292,9 @@ class XInputMultiseatApp(Gtk.ApplicationWindow):
 
     def _stop_and_exit_app(self):
         """Unified shutdown: stops supervisor, kiosks, devices, and closes GUI."""
-        from core.session_manager import session_mgr
+        if self._shutting_down:
+            return
+        self._shutting_down = True
         logger.info("Executing unified shutdown from Control Board...")
         session_mgr.stop_session(exit_gui=True)
         self.destroy()
@@ -546,15 +571,14 @@ class XInputMultiseatApp(Gtk.ApplicationWindow):
     # Clean Shutdown
     # -----------------------------------------------------------------------
     def _on_window_destroy(self, _widget):
-        logger.info("Window closing. Stopping kiosk watchdog and overlay services...")
+        logger.info("Window closing. Binding GUI exit with full kiosk & desktop session teardown...")
         overlay_state.clear()  # never leave a seat whitelisted after the GUI exits
         if hasattr(self, 'hotkey_mgr') and self.hotkey_mgr:
             self.hotkey_mgr.stop()
         if hasattr(self, 'ipc_server') and self.ipc_server:
             self.ipc_server.stop()
-        if hasattr(self, 'display_guard') and self.display_guard:
-            self.display_guard.stop()
-            self.display_guard = None
-        self.kiosk_mgr.stop_watchdog()
+        if not self._shutting_down:
+            self._shutting_down = True
+            session_mgr.stop_session(exit_gui=False)
         if Gtk.main_level() > 0:
             Gtk.main_quit()

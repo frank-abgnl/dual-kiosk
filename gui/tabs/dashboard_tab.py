@@ -207,6 +207,7 @@ class DashboardTab(Gtk.Box):
             from core.session_manager import session_mgr
             ok, msg = session_mgr.start_session(on_event=lambda m: self.append_log(m))
             if ok:
+                GLib.idle_add(self.app.hotkey_mgr.update_seat_keyboards, self.app.seating_engine.seat_keyboards)
                 self.append_log("Dual Firefox kiosks launched successfully.")
                 self.append_log("⚡ Super Shortcut active: Press Ctrl + Shift + M + S on any seat to overlay control panel on your screen.")
                 GLib.idle_add(self.app.show_info, "Pseudo-seating active! Dual Firefox kiosks running (Ctrl+Shift+M+S to overlay).", 0)

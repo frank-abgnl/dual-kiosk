@@ -29,6 +29,7 @@ CONFIG_DIR = Path.home() / ".config" / "xinput-seats"
 PID_FILE = CONFIG_DIR / "launcher.pid"
 LOCK_FILE = CONFIG_DIR / "launcher.lock"
 LOG_FILE = CONFIG_DIR / "launcher.log"
+
 CONFIG_DIR.mkdir(parents=True, exist_ok=True)
 
 
@@ -74,6 +75,9 @@ class SessionManager:
         self.kiosk.on_window_ready = self.engine.focus_seat_keyboard
         self.kiosk.engine = self.engine
         self.uninstaller = Uninstaller()
+        self.display_guard = None
+        self.hotkey_mgr = None
+        self.reseat_key = None
 
     # -----------------------------------------------------------------------
     # Status & Inspection
@@ -85,7 +89,6 @@ class SessionManager:
     def find_all_kiosks(self) -> List[int]:
         """Finds all Firefox processes on the system running with our kiosk profiles."""
         kiosk_pids = set(self.uninstaller.find_kiosks())
-        # Also include any discovered through KioskManager
         discovered = self.kiosk.discover_running_kiosks()
         for s in discovered.values():
             if s.get("pid"):
@@ -95,6 +98,48 @@ class SessionManager:
     def is_session_active(self) -> bool:
         """True if either a supervisor is running or any kiosk browser is running."""
         return (get_supervisor_pid() is not None) or len(self.find_all_kiosks()) > 0
+
+    # -----------------------------------------------------------------------
+    # Runtime Services (DisplayGuard & Reseat Hotkey)
+    # -----------------------------------------------------------------------
+    def _start_runtime_services(self, on_event: Optional[Callable[[str], None]] = None):
+        from core.display_guard import DisplayGuard
+        from core.combo_hotkey import ComboHotkey
+
+        if not self.display_guard or not self.display_guard.is_running():
+            self.display_guard = DisplayGuard(self.kiosk, self.engine, interval=1.2, on_event=on_event)
+            self.display_guard.start()
+
+        if not self.reseat_key:
+            self.reseat_key = ComboHotkey(
+                "r",
+                lambda *_: self.reseat_session(hard=False, on_event=on_event),
+                seat_keyboards=self.engine.seat_keyboards,
+                name="reseat",
+            )
+            self.reseat_key.start()
+        else:
+            self.reseat_key.update_seat_keyboards(self.engine.seat_keyboards)
+
+    def _stop_runtime_services(self):
+        if self.display_guard:
+            try:
+                self.display_guard.stop()
+            except Exception:
+                pass
+            self.display_guard = None
+        if self.reseat_key:
+            try:
+                self.reseat_key.stop()
+            except Exception:
+                pass
+            self.reseat_key = None
+        if self.hotkey_mgr:
+            try:
+                self.hotkey_mgr.stop()
+            except Exception:
+                pass
+            self.hotkey_mgr = None
 
     # -----------------------------------------------------------------------
     # Unified Shut-Down Wrapper
@@ -119,6 +164,9 @@ class SessionManager:
                     pass
 
         _emit("Stopping multiseat kiosk session...")
+
+        # 0. Stop runtime services in this process
+        self._stop_runtime_services()
 
         # 1. Notify running Control Board overlay via IPC
         try:
@@ -239,7 +287,6 @@ class SessionManager:
         if len(active_displays) < 2:
             disp_name = active_displays[0]["name"] if active_displays else "Unknown"
             _emit(f"Only 1 display detected ({disp_name}). Dual-seat kiosk requires 2 monitors.")
-
             from gui.display_dialog import run_single_display_error_modal
             ok_retry, new_disp = run_single_display_error_modal(active_displays)
             if not ok_retry or not new_disp or len(new_disp) < 2:
@@ -299,11 +346,67 @@ class SessionManager:
 
         if ok:
             PID_FILE.write_text(str(os.getpid()))
+            self._start_runtime_services(on_event=on_event)
             _emit("Dual Firefox kiosks launched successfully!")
             return True, "Dual Firefox kiosks running."
         else:
             _emit("Failed to launch one or more Firefox kiosks.")
             return False, "Failed to launch Firefox kiosks."
+
+    def restart_session(
+        self,
+        reassign: bool = False,
+        on_event: Optional[Callable[[str], None]] = None,
+    ) -> Tuple[bool, str]:
+        """Stops any running session (without exiting the GUI) and starts a fresh session."""
+        self.stop_session(exit_gui=False, on_event=on_event)
+        time.sleep(0.5)
+        return self.start_session(reassign=reassign, no_detect=False, on_event=on_event)
+
+    def reseat_session(
+        self,
+        hard: bool = False,
+        on_event: Optional[Callable[[str], None]] = None,
+    ) -> bool:
+        """Re-seats all devices of a running session (soft = keep browsers, hard = restart browsers)."""
+        def _emit(msg: str):
+            logger.info(msg)
+            if on_event:
+                try:
+                    on_event(msg)
+                except Exception:
+                    pass
+
+        try:
+            from core.hotkey_manager import send_overlay_command
+            send_overlay_command("HIDE")
+            alive = (
+                len(self.kiosk.running_processes) >= 2
+                and all(p.poll() is None for p in self.kiosk.running_processes.values())
+            )
+            if hard or not alive:
+                ok, _ = self.restart_session(reassign=False, on_event=on_event)
+                return ok
+
+            _emit("Re-seating all seats...")
+            self.engine.reset_all_to_core()
+            displays_now, total_now = self.dm.get_displays()
+            cfg_now = self.cfg_mgr.auto_generate_config(self.dm, force_reassign=False)
+            seats_now = cfg_now.get("seats", [])
+            seats_now, _ = self.dm.assign_displays_to_seats(seats_now, displays_now)
+            cfg_now["seats"] = seats_now
+            self.cfg_mgr.save_config(cfg_now)
+            self.engine.apply_seating(seats_now, displays_now, (total_now["width"], total_now["height"]))
+            if self.reseat_key:
+                self.reseat_key.update_seat_keyboards(self.engine.seat_keyboards)
+            for sid, win in list(self.kiosk.window_ids.items()):
+                self.engine.focus_seat_keyboard(sid, win)
+            _emit("Seats re-assigned.")
+            return True
+        except Exception as exc:
+            logger.exception("Re-seat failed")
+            _emit(f"Re-seat failed: {exc}")
+            return False
 
 
 # Global singleton instance
