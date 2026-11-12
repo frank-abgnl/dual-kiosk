@@ -6,11 +6,13 @@ with automatic hardware reseating upon system power recovery.
 """
 
 import os
-import time
+import signal
 import subprocess
+import threading
+import time
 import logging
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Callable, Optional, Tuple
 
 logger = logging.getLogger("xinput_seating.autostart")
 
@@ -191,40 +193,69 @@ def install_user_service() -> bool:
     return enable_autostart()
 
 
-def run_startup_reseat_and_launch(wait_timeout_sec: int = 20) -> bool:
+def run_startup_reseat_and_launch(
+    wait_timeout_sec: int = 20,
+    stop_event: Optional[threading.Event] = None,
+    sleep_fn: Callable[[float], None] = time.sleep,
+) -> int:
     """
     Executed on system boot / power recovery.
-    Delegates to the unified SessionManager and binds the GUI & desktop lifecycle.
+    Loops start_session with exponential backoff on retryable failures.
+    Polls for a stop request using a threading.Event set by SIGTERM/SIGINT handlers.
+    When stopped by signal, calls stop_session and returns 0.
+    Returns 1 if startup encounters an unrecoverable error.
     """
-    from core.session_manager import session_mgr
+    from core.session_manager import session_mgr, StartResult
     from core.hotkey_manager import HotkeyManager
 
     logger.info("Starting automated power outage recovery / boot reseating sequence...")
 
-    start_time = time.time()
-    while time.time() - start_time < wait_timeout_sec:
-        active_disp, _ = session_mgr.dm.probe_and_activate_displays()
-        if active_disp:
-            break
-        time.sleep(1)
-
-    ok, msg = session_mgr.start_session(on_event=logger.info)
-    if ok:
-        logger.info("Dual kiosks launched successfully on startup!")
-        session_mgr.hotkey_mgr = HotkeyManager(launch_gui_if_needed=True, seat_keyboards=session_mgr.engine.seat_keyboards)
-        session_mgr.hotkey_mgr.start()
-        logger.info("Super Keyboard Shortcut (Ctrl+Shift+M+S) listener active for kiosk overlay.")
+    stop = stop_event or threading.Event()
+    if threading.current_thread() is threading.main_thread():
         try:
-            while True:
-                time.sleep(2)
-                seats = session_mgr.cfg_mgr.load_config().get("seats", [])
-                reseated = session_mgr.engine.check_and_reseat_hotplugged_devices(seats)
-                if reseated:
-                    for m in reseated:
-                        logger.info(f"[Autostart Hotplug Reseat] {m}")
-        except (KeyboardInterrupt, SystemExit):
-            logger.info("Stopping kiosks, display guard, hotkey listener and resetting seating...")
-            session_mgr.stop_session(exit_gui=True, on_event=logger.info)
-    else:
-        logger.error(f"Failed to launch kiosks on startup: {msg}")
-    return ok
+            for sig in (signal.SIGINT, signal.SIGTERM):
+                signal.signal(sig, lambda *_: stop.set())
+        except Exception as exc:
+            logger.debug(f"Could not register signal handlers: {exc}")
+
+    delay = 2
+    res = None
+    while not stop.is_set():
+        res = session_mgr.start_session(on_event=logger.info)
+        if res.ok:
+            break
+        if res.code in (StartResult.NEED_DISPLAYS, StartResult.NEED_DEVICES, StartResult.KIOSK_FAILED):
+            logger.warning(f"Startup attempt failed ({res.code}: {res.message}), retrying in {delay}s...")
+            sleep_fn(delay)
+            delay = min(delay * 2, 60)
+        else:
+            logger.error(f"Startup unrecoverable error ({res.code}): {res.message}")
+            return 1
+
+    if stop.is_set():
+        session_mgr.stop_session(exit_gui=True, on_event=logger.info)
+        return 0
+
+    if not res or not res.ok:
+        logger.error(f"Failed to launch kiosks on startup: {res.message if res else 'Unknown'}")
+        return 1
+
+    logger.info("Dual kiosks launched successfully on startup!")
+    session_mgr.hotkey_mgr = HotkeyManager(launch_gui_if_needed=True, seat_keyboards=session_mgr.engine.seat_keyboards)
+    session_mgr.hotkey_mgr.start()
+    logger.info("Super Keyboard Shortcut (Ctrl+Shift+M+S) listener active for kiosk overlay.")
+
+    try:
+        while not stop.is_set():
+            time.sleep(2)
+            seats = session_mgr.cfg_mgr.load_config().get("seats", [])
+            reseated = session_mgr.engine.check_and_reseat_hotplugged_devices(seats)
+            if reseated:
+                for m in reseated:
+                    logger.info(f"[Autostart Hotplug Reseat] {m}")
+    except (KeyboardInterrupt, SystemExit):
+        stop.set()
+
+    logger.info("Stopping kiosks, display guard, hotkey listener and resetting seating...")
+    session_mgr.stop_session(exit_gui=True, on_event=logger.info)
+    return 0

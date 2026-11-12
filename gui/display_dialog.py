@@ -119,6 +119,7 @@ class DisplayDialog(Gtk.Window):
         disconnected_display: str = "",
         seat_id: str = "seat2",
         on_success_callback=None,
+        standalone: bool = False,
     ):
         super().__init__(type=Gtk.WindowType.TOPLEVEL)
         self.mode = mode
@@ -126,6 +127,7 @@ class DisplayDialog(Gtk.Window):
         self.disconnected_display = disconnected_display
         self.seat_id = seat_id
         self.on_success_callback = on_success_callback
+        self.standalone = standalone
         self.dm = DeviceManager()
         self.success_displays: Optional[List[Dict]] = None
 
@@ -338,7 +340,7 @@ class DisplayDialog(Gtk.Window):
 
     def _close_and_quit(self, exit_code: int = 0):
         self.destroy()
-        if Gtk.main_level() > 0:
+        if self.standalone and Gtk.main_level() > 0:
             Gtk.main_quit()
         return False
 
@@ -387,6 +389,7 @@ def main():
         active_display=active_name,
         disconnected_display=args.disconnected,
         seat_id=args.seat,
+        standalone=True,
     )
     dlg.connect("destroy", lambda _: Gtk.main_quit())
     dlg.present()

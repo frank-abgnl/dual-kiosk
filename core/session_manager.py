@@ -20,12 +20,30 @@ import signal
 import subprocess
 import sys
 import time
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Callable, Dict, Iterator, List, Optional, Tuple
+
+from core.paths import CONFIG_DIR, PID_FILE, LOCK_FILE, LOG_FILE, PROFILES_DIR
 
 logger = logging.getLogger("xinput_seating.session")
 
-from core.paths import CONFIG_DIR, PID_FILE, LOCK_FILE, LOG_FILE, PROFILES_DIR
+
+@dataclass
+class StartResult:
+    ok: bool
+    code: str
+    message: str
+
+    OK = "OK"
+    NEED_DISPLAYS = "NEED_DISPLAYS"
+    NEED_DEVICES = "NEED_DEVICES"
+    KIOSK_FAILED = "KIOSK_FAILED"
+    ALREADY_RUNNING = "ALREADY_RUNNING"
+
+    def __iter__(self) -> Iterator:
+        yield self.ok
+        yield self.message
 
 
 def _pid_alive(pid: int) -> bool:
@@ -255,12 +273,11 @@ class SessionManager:
         reassign: bool = False,
         no_detect: bool = False,
         on_event: Optional[Callable[[str], None]] = None,
-    ) -> Tuple[bool, str]:
+    ) -> StartResult:
         """
         Unified start-up wrapper.
-        Validates displays (modal with Retry if < 2 displays), assigns seats respecting
-        preference & priority rules, applies seating, launches dual kiosks, and starts
-        supervisors.
+        Validates displays, assigns seats respecting preference & priority rules,
+        applies seating, launches dual kiosks, and starts supervisors.
         """
         def _emit(msg: str):
             logger.info(msg)
@@ -280,15 +297,10 @@ class SessionManager:
         # 1. Automatic Display Detection: Require at least 2 connected active displays
         active_displays, total = self.dm.probe_and_activate_displays()
         if len(active_displays) < 2:
-            disp_name = active_displays[0]["name"] if active_displays else "Unknown"
-            _emit(f"Only 1 display detected ({disp_name}). Dual-seat kiosk requires 2 monitors.")
-            from gui.display_dialog import run_single_display_error_modal
-            ok_retry, new_disp = run_single_display_error_modal(active_displays)
-            if not ok_retry or not new_disp or len(new_disp) < 2:
-                _emit("Launch aborted: Second display required.")
-                return False, "Dual kiosks require at least two connected displays."
-            active_displays = new_disp
-            total = self.dm.get_displays()[1]
+            disp_names = ", ".join(d.get("name", "Unknown") for d in active_displays) or "none"
+            msg = f"Only {len(active_displays)} display(s) detected: {disp_names}"
+            _emit(f"Fewer than 2 displays detected ({disp_names}). Dual-seat kiosk requires 2 monitors.")
+            return StartResult(ok=False, code=StartResult.NEED_DISPLAYS, message=msg)
 
         displays = active_displays
 
@@ -343,16 +355,25 @@ class SessionManager:
             PID_FILE.write_text(str(os.getpid()))
             self._start_runtime_services(on_event=on_event)
             _emit("Dual Firefox kiosks launched successfully!")
-            return True, "Dual Firefox kiosks running."
+            return StartResult(ok=True, code=StartResult.OK, message="Dual Firefox kiosks running.")
         else:
             _emit("Failed to launch one or more Firefox kiosks.")
-            return False, "Failed to launch Firefox kiosks."
+            return StartResult(ok=False, code=StartResult.KIOSK_FAILED, message="Failed to launch Firefox kiosks.")
+
+    def start_session_legacy(
+        self,
+        reassign: bool = False,
+        no_detect: bool = False,
+        on_event: Optional[Callable[[str], None]] = None,
+    ) -> Tuple[bool, str]:
+        res = self.start_session(reassign=reassign, no_detect=no_detect, on_event=on_event)
+        return res.ok, res.message
 
     def restart_session(
         self,
         reassign: bool = False,
         on_event: Optional[Callable[[str], None]] = None,
-    ) -> Tuple[bool, str]:
+    ) -> StartResult:
         """Stops any running session (without exiting the GUI) and starts a fresh session."""
         self.stop_session(exit_gui=False, on_event=on_event)
         time.sleep(0.5)

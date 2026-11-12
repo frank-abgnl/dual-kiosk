@@ -169,21 +169,32 @@ class XInputMultiseatApp(Gtk.ApplicationWindow):
         elif self._auto_start_session:
             GLib.idle_add(self._auto_start_kiosks_on_launch, False, target_seat)
 
+    def _show_display_dialog_and_retry(self, show_overlay_after: bool = False, target_seat: str = "seat1"):
+        from gui.display_dialog import DisplayDialog
+        dlg = DisplayDialog(
+            mode="error",
+            on_success_callback=lambda _: self._auto_start_kiosks_on_launch(show_overlay_after, target_seat),
+        )
+        dlg.set_transient_for(self)
+        dlg.show_all()
+
     def _auto_start_kiosks_on_launch(self, show_overlay_after: bool = False, target_seat: str = "seat1"):
         """Starts the desktop seating & kiosk session automatically when the GUI starts if not already active."""
         if not session_mgr.is_session_active():
             self.dashboard_tab.append_log("Auto-starting seating and dual Firefox kiosks with GUI startup...")
             def _worker():
-                ok, msg = session_mgr.start_session(on_event=lambda m: self.dashboard_tab.append_log(m))
-                if ok:
+                res = session_mgr.start_session(on_event=lambda m: self.dashboard_tab.append_log(m))
+                if res.ok:
                     GLib.idle_add(self.hotkey_mgr.update_seat_keyboards, self.seating_engine.seat_keyboards)
                     GLib.idle_add(self.show_info, "Pseudo-seating active! Dual Firefox kiosks running.", 0)
                     if show_overlay_after:
                         GLib.idle_add(self.show_overlay, target_seat)
                     else:
                         GLib.idle_add(self.iconify)
+                elif res.code == "NEED_DISPLAYS":
+                    GLib.idle_add(self._show_display_dialog_and_retry, show_overlay_after, target_seat)
                 else:
-                    GLib.idle_add(self.show_info, msg, 1)
+                    GLib.idle_add(self.show_info, res.message, 1)
                 GLib.idle_add(self.refresh_all)
             threading.Thread(target=_worker, daemon=True).start()
         else:

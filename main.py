@@ -67,7 +67,9 @@ def run_cli(args):
     if args.auto_start:
         # Automated boot / power outage recovery sequence
         print("[*] Running automatic boot & reseating sequence...")
-        run_startup_reseat_and_launch()
+        rc = run_startup_reseat_and_launch()
+        if rc != 0:
+            sys.exit(1)
         return
 
     if args.enable_autostart:
