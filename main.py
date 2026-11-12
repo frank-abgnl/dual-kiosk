@@ -234,10 +234,27 @@ def main():
     if (args.start or args.stop or args.status or args.auto or
             args.reset_devices or args.auto_start or args.enable_autostart or
             args.disable_autostart or args.toggle_autostart):
+        if args.start or args.auto_start:
+            from core.preflight import preflight
+            pref = preflight()
+            for w in pref.warnings:
+                logger.warning(f"Preflight warning: {w}")
+            if not pref.ok:
+                for err in pref.errors:
+                    logger.error(f"Preflight error: {err}")
+                sys.exit(1)
         run_cli(args)
         return
 
     # Default: Run GTK3 GUI
+    from core.preflight import preflight
+    pref = preflight()
+    for w in pref.warnings:
+        logger.warning(f"Preflight warning: {w}")
+    if not pref.ok:
+        for err in pref.errors:
+            logger.error(f"Preflight error: {err}")
+        sys.exit(1)
     try:
         import gi
         gi.require_version('Gtk', '3.0')

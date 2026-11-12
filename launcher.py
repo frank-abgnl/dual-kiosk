@@ -123,6 +123,14 @@ def acquire_lock():
 
 
 def launch(args) -> int:
+    from core.preflight import preflight
+    pref = preflight()
+    for w in pref.warnings:
+        log.warning(f"Preflight warning: {w}")
+    if not pref.ok:
+        for err in pref.errors:
+            notify(f"Preflight error: {err}", urgent=True)
+        return 1
     from core.supervisor import run
     return run(args)
 

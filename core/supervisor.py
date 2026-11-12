@@ -123,13 +123,15 @@ def run(
 
     ensure_state_dir()
 
-    missing = [c for c in REQUIRED_TOOLS if not shutil.which(c)]
-    if missing:
-        notify(f"Missing tools: {', '.join(missing)}. Install them and try again.", urgent=True)
+    from core.preflight import preflight
+    pref = preflight()
+    for w in pref.warnings:
+        logger.warning(f"Preflight warning: {w}")
+    if not pref.ok:
+        for err in pref.errors:
+            logger.error(f"Preflight error: {err}")
+            notify(f"Preflight error: {err}", urgent=True)
         return 1
-
-    if not os.environ.get("DISPLAY"):
-        os.environ["DISPLAY"] = ":0"
 
     lock = acquire_lock(lock_path)
     if lock is None:
