@@ -14,20 +14,26 @@ import time
 class DeviceFinderDialog(Gtk.Dialog):
     """Interactive dialog that listens for input events to immediately identify physical devices."""
 
-    def __init__(self, parent, target_type="any"):
+    def __init__(self, parent=None, target_type="any"):
+        transient = parent if (parent and isinstance(parent, Gtk.Window)) else None
         super().__init__(
             title="Interactive Device Finder",
-            transient_for=parent,
+            transient_for=transient,
             modal=True,
-            flags=Gtk.DialogFlags.DESTROY_WITH_PARENT,
+            destroy_with_parent=True,
         )
-        self.set_default_size(450, 220)
+        self.set_default_size(520, 260)
+        self.app = parent
         self.target_type = target_type
         self.detected_device = None
+        self.detected_xinput_id = None
+        self.detected_cls = None
 
         self.add_button("Cancel", Gtk.ResponseType.CANCEL)
-        self.btn_select = self.add_button("Select Device", Gtk.ResponseType.OK)
-        self.btn_select.set_sensitive(False)
+        self.btn_seat1 = self.add_button("Assign to Seat 1", 101)
+        self.btn_seat2 = self.add_button("Assign to Seat 2", 102)
+        self.btn_seat1.set_sensitive(False)
+        self.btn_seat2.set_sensitive(False)
 
         box = self.get_content_area()
         box.set_spacing(10)
@@ -55,31 +61,90 @@ class DeviceFinderDialog(Gtk.Dialog):
         self.connect("key-press-event", self._on_key_event)
         self.connect("motion-notify-event", self._on_motion_event)
         self.connect("button-press-event", self._on_button_event)
+        self.connect("response", self._on_response)
 
         self.show_all()
+
+    def _find_xinput_id(self, dev_name: str, dev_cls: str):
+        try:
+            from core.device_manager import DeviceManager
+            dm = getattr(self.app, "device_mgr", None) or DeviceManager()
+            _, ptrs, kbds = dm.get_xinput_hierarchy()
+            pool = ptrs if dev_cls == "pointer" else kbds
+            for d in pool:
+                if not d.get("is_xtest") and d.get("name") == dev_name:
+                    return d.get("id")
+            dev_lower = dev_name.strip().lower()
+            for d in pool:
+                if not d.get("is_xtest") and (d.get("name") or "").strip().lower() == dev_lower:
+                    return d.get("id")
+            for d in ptrs + kbds:
+                if not d.get("is_xtest") and (d.get("name") or "").strip().lower() == dev_lower:
+                    return d.get("id")
+        except Exception:
+            pass
+        return None
 
     def _on_key_event(self, _widget, event):
         dev = event.get_source_device() or event.get_device()
         dev_name = dev.get_name() if dev else "Unknown Keyboard"
-        self._set_detected(dev_name, "Keyboard")
+        self._set_detected(dev_name, "Keyboard", "keyboard")
         return False
 
     def _on_motion_event(self, _widget, event):
         dev = event.get_source_device() or event.get_device()
         dev_name = dev.get_name() if dev else "Unknown Pointer"
-        self._set_detected(dev_name, "Pointer / Mouse")
+        self._set_detected(dev_name, "Pointer / Mouse", "pointer")
         return False
 
     def _on_button_event(self, _widget, event):
         dev = event.get_source_device() or event.get_device()
         dev_name = dev.get_name() if dev else "Unknown Pointer"
-        self._set_detected(dev_name, "Mouse Button")
+        self._set_detected(dev_name, "Mouse Button", "pointer")
         return False
 
-    def _set_detected(self, name, event_type):
+    def _set_detected(self, name: str, event_type: str, dev_cls: str = "pointer"):
         self.detected_device = name
-        self.result_lbl.set_markup(f'Detected: <b>{name}</b>  <span color="#26a269">({event_type})</span>')
-        self.btn_select.set_sensitive(True)
+        self.detected_cls = dev_cls
+        self.detected_xinput_id = self._find_xinput_id(name, dev_cls)
+        id_str = f"xinput ID: {self.detected_xinput_id}" if self.detected_xinput_id is not None else "xinput ID: Unknown"
+        self.result_lbl.set_markup(f'Detected: <b>{name}</b> ({id_str}) <span color="#26a269">({event_type})</span>')
+        self.btn_seat1.set_sensitive(True)
+        self.btn_seat2.set_sensitive(True)
+
+    def _on_response(self, dialog, response_id):
+        if response_id in (101, 102):
+            seat_key = "seat1" if response_id == 101 else "seat2"
+            seat_idx = 0 if response_id == 101 else 1
+            self._assign_to_seat(seat_key, seat_idx)
+
+    def _assign_to_seat(self, seat_key: str, seat_idx: int):
+        if not self.detected_device:
+            return
+        try:
+            cfg_mgr = getattr(self.app, "config_mgr", None)
+            if not cfg_mgr:
+                from core.config_manager import ConfigManager
+                cfg_mgr = ConfigManager()
+
+            def _mutate(cfg):
+                seats = cfg.setdefault("seats", [])
+                while len(seats) <= seat_idx:
+                    seats.append({"id": f"seat{len(seats)+1}"})
+                seat = seats[seat_idx]
+                if self.detected_cls == "pointer":
+                    seat["mouse_name"] = self.detected_device
+                    seat["mouse_id"] = self.detected_xinput_id
+                else:
+                    seat["keyboard_name"] = self.detected_device
+                    seat["keyboard_id"] = self.detected_xinput_id
+
+            cfg_mgr.update(_mutate)
+            if hasattr(self.app, "show_info"):
+                self.app.show_info(f"Assigned {self.detected_device} to {seat_key}.", 0)
+        except Exception as exc:
+            if hasattr(self.app, "show_info"):
+                self.app.show_info(f"Failed to assign: {exc}", 1)
 
 
 class DevicesTab(Gtk.Box):
