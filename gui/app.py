@@ -16,6 +16,10 @@ from pathlib import Path
 from typing import Optional
 
 from core import overlay_state
+from core.config_manager import ConfigManager
+from core.device_manager import DeviceManager
+from core.kiosk_manager import KioskManager
+from core.xinput_seating import XInputSeatingEngine
 from core.session_manager import session_mgr
 from core.hotkey_manager import HotkeyManager, OverlayIPCServer, get_seat_screen_geometry
 from gui.styles import CSS_STYLES
@@ -40,6 +44,9 @@ class XInputMultiseatApp(Gtk.ApplicationWindow):
         self._overlay_xid = None
         self._hotplug_timer = None
         self._hotplug_busy = False
+        self._shutting_down = False
+        # Set to True if opening the GUI should also start the kiosks automatically.
+        self._auto_start_session = False
 
         # ── Initialize Core Engines ───────────────────────────────────────
         self.device_mgr = DeviceManager()
@@ -267,7 +274,6 @@ class XInputMultiseatApp(Gtk.ApplicationWindow):
 
     def _confirm_and_quit_app(self):
         """Asks user confirmation to stop kiosks, supervisor, and close the Control Board."""
-        from core.session_manager import session_mgr
         if session_mgr.is_session_active():
             dlg = Gtk.MessageDialog(
                 transient_for=self,
@@ -306,7 +312,6 @@ class XInputMultiseatApp(Gtk.ApplicationWindow):
         When kiosks are active, prompt the user whether to hide the overlay,
         stop kiosks and exit completely, or cancel.
         """
-        from core.session_manager import session_mgr
         if session_mgr.is_session_active():
             dlg = Gtk.MessageDialog(
                 transient_for=self,
