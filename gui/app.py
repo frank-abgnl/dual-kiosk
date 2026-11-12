@@ -20,8 +20,8 @@ from core.config_manager import ConfigManager
 from core.device_manager import DeviceManager
 from core.kiosk_manager import KioskManager
 from core.xinput_seating import XInputSeatingEngine
-from core.session_manager import session_mgr
-from core.hotkey_manager import HotkeyManager, OverlayIPCServer, get_seat_screen_geometry
+from core.session_manager import session_mgr, get_supervisor_pid
+from core.hotkey_manager import OverlayIPCServer, get_seat_screen_geometry
 from gui.styles import CSS_STYLES
 from gui.tabs import DashboardTab, SeatsTab, DevicesTab, TestTab, ConfigTab
 
@@ -142,18 +142,14 @@ class XInputMultiseatApp(Gtk.ApplicationWindow):
         self.notebook.append_page(self.config_tab, Gtk.Label(label="⚙  Config & Profiles"))
 
         # ── Global Hotkey & IPC Services ──────────────────────────────────
-        self.hotkey_mgr = HotkeyManager(
-            on_trigger=self._on_hotkey_triggered,
-            on_device_changed=self._on_xinput_hierarchy_changed,
-        )
-        self.hotkey_mgr.update_seat_keyboards(self.seating_engine.seat_keyboards)
-        self.hotkey_mgr.start()
+        self.hotkey_mgr = None
 
         self.ipc_server = OverlayIPCServer(on_command=self._on_ipc_command)
         self.ipc_server.start()
 
-        # Periodic hotplug reseating check for locked peripherals
-        GLib.timeout_add_seconds(3, self._periodic_hotplug_check)
+        # Periodic hotplug monitoring in GUI only when running standalone with no supervisor
+        if not get_supervisor_pid():
+            GLib.timeout_add_seconds(3, self._periodic_hotplug_check)
 
         # Connect window events
         self.connect("destroy", self._on_window_destroy)
@@ -185,7 +181,8 @@ class XInputMultiseatApp(Gtk.ApplicationWindow):
             def _worker():
                 res = session_mgr.start_session(on_event=lambda m: self.dashboard_tab.append_log(m))
                 if res.ok:
-                    GLib.idle_add(self.hotkey_mgr.update_seat_keyboards, self.seating_engine.seat_keyboards)
+                    if self.hotkey_mgr:
+                        GLib.idle_add(self.hotkey_mgr.update_seat_keyboards, self.seating_engine.seat_keyboards)
                     GLib.idle_add(self.show_info, "Pseudo-seating active! Dual Firefox kiosks running.", 0)
                     if show_overlay_after:
                         GLib.idle_add(self.show_overlay, target_seat)
@@ -199,7 +196,7 @@ class XInputMultiseatApp(Gtk.ApplicationWindow):
             threading.Thread(target=_worker, daemon=True).start()
         else:
             self._ensure_masters()
-            if self.seating_engine.seat_keyboards:
+            if self.hotkey_mgr and self.seating_engine.seat_keyboards:
                 self.hotkey_mgr.update_seat_keyboards(self.seating_engine.seat_keyboards)
             self.refresh_all()
         return False
@@ -377,7 +374,7 @@ class XInputMultiseatApp(Gtk.ApplicationWindow):
         self.active_overlay_seat = seat_id
 
         self._ensure_masters()
-        if self.seating_engine.seat_keyboards:
+        if self.hotkey_mgr and self.seating_engine.seat_keyboards:
             self.hotkey_mgr.update_seat_keyboards(self.seating_engine.seat_keyboards)
 
         # 1. Whitelist FIRST (shared file -> also pauses a watchdog in another process)

@@ -5,12 +5,13 @@ Handles automatic startup configuration via systemd user services and XDG autost
 with automatic hardware reseating upon system power recovery.
 """
 
+import logging
 import os
+import shutil
 import signal
 import subprocess
 import threading
 import time
-import logging
 from pathlib import Path
 from typing import Callable, Optional, Tuple
 
@@ -18,6 +19,7 @@ logger = logging.getLogger("xinput_seating.autostart")
 
 PROJECT_DIR = Path(__file__).resolve().parent.parent
 START_SH = PROJECT_DIR / "start.sh"
+LAUNCH_SH = PROJECT_DIR / "launch.sh"
 SERVICE_NAME = "dual-kiosk.service"
 SYSTEMD_USER_DIR = Path.home() / ".config" / "systemd" / "user"
 SYSTEMD_SERVICE_PATH = SYSTEMD_USER_DIR / SERVICE_NAME
@@ -62,69 +64,86 @@ def is_autostart_enabled() -> bool:
         return False
 
 
+def is_systemctl_user_available() -> bool:
+    """Checks if systemctl --user is functional in the current environment."""
+    if shutil.which("systemctl") is None:
+        return False
+    _, _, rc = run_command(["systemctl", "--user", "status"])
+    return rc in (0, 3)
+
+
 def enable_autostart() -> bool:
     """
-    Enables automatic launch on startup by installing the systemd user service,
-    generating an XDG desktop autostart entry, and setting config flags.
+    Enables automatic launch on startup.
+    Writes only the systemd user unit if systemctl --user is available.
+    Writes the XDG desktop autostart entry only if systemctl --user is unavailable.
     """
     logger.info("Enabling launch on startup for power outage recovery...")
-    SYSTEMD_USER_DIR.mkdir(parents=True, exist_ok=True)
-    XDG_AUTOSTART_DIR.mkdir(parents=True, exist_ok=True)
 
-    if not START_SH.is_file():
-        logger.error(f"Cannot enable autostart: start.sh not found at {START_SH}")
+    target_script = LAUNCH_SH if LAUNCH_SH.is_file() else START_SH
+    if not target_script.is_file():
+        logger.error(f"Cannot enable autostart: launcher script not found at {target_script}")
         return False
 
     # Ensure executable permissions
     try:
-        START_SH.chmod(START_SH.stat().st_mode | 0o755)
+        target_script.chmod(target_script.stat().st_mode | 0o755)
     except Exception as exc:
-        logger.warning(f"Failed to chmod {START_SH}: {exc}")
+        logger.warning(f"Failed to chmod {target_script}: {exc}")
 
-    # 1. Systemd User Service
-    service_contents = f"""[Unit]
+    use_systemd = is_systemctl_user_available()
+
+    if use_systemd:
+        SYSTEMD_USER_DIR.mkdir(parents=True, exist_ok=True)
+        # 1. Systemd User Service: ExecStart="<path>/launch.sh" (quoted)
+        service_contents = f"""[Unit]
 Description=Dual Kiosk Auto-Start & Reseating Service
-After=graphical-session.target xdg-desktop-autostart.target
+After=graphical-session.target
 Wants=graphical-session.target
 
 [Service]
 Type=simple
 Environment="DISPLAY=:0"
-ExecStart={START_SH} --auto-start
+ExecStart="{target_script}"
 Restart=on-failure
 RestartSec=3
 
 [Install]
-WantedBy=default.target
+WantedBy=graphical-session.target
 """
-    try:
-        SYSTEMD_SERVICE_PATH.write_text(service_contents)
-        logger.info(f"Systemd service file written to {SYSTEMD_SERVICE_PATH}")
-    except Exception as exc:
-        logger.error(f"Failed to write systemd service unit: {exc}")
-        return False
+        try:
+            SYSTEMD_SERVICE_PATH.write_text(service_contents)
+            logger.info(f"Systemd service file written to {SYSTEMD_SERVICE_PATH}")
+        except Exception as exc:
+            logger.error(f"Failed to write systemd service unit: {exc}")
+            return False
 
-    # 2. XDG Desktop Autostart Entry (fallback and broad desktop session compatibility)
-    desktop_contents = f"""[Desktop Entry]
+        # Reload systemd user daemon and enable service
+        run_command(["systemctl", "--user", "daemon-reload"])
+        out, err, rc = run_command(["systemctl", "--user", "enable", SERVICE_NAME])
+        if rc != 0:
+            logger.warning(f"systemctl --user enable warning: {err or out}")
+
+        # Clean up any conflicting XDG entry
+        XDG_DESKTOP_PATH.unlink(missing_ok=True)
+    else:
+        # Fallback: Write XDG Desktop Autostart Entry only if systemctl --user is unavailable
+        XDG_AUTOSTART_DIR.mkdir(parents=True, exist_ok=True)
+        desktop_contents = f"""[Desktop Entry]
 Type=Application
 Name=Dual Kiosk Auto-Reseat & Launch
 Comment=Automatically reseats displays and USB devices and launches kiosks on startup
-Exec={START_SH} --auto-start
+Exec="{target_script}"
 Hidden=false
 NoDisplay=false
 X-GNOME-Autostart-enabled=true
 """
-    try:
-        XDG_DESKTOP_PATH.write_text(desktop_contents)
-        logger.info(f"XDG autostart file written to {XDG_DESKTOP_PATH}")
-    except Exception as exc:
-        logger.warning(f"Failed to write XDG autostart desktop file: {exc}")
-
-    # 3. Reload systemd user daemon and enable service
-    run_command(["systemctl", "--user", "daemon-reload"])
-    out, err, rc = run_command(["systemctl", "--user", "enable", SERVICE_NAME])
-    if rc != 0:
-        logger.warning(f"systemctl --user enable warning: {err or out}")
+        try:
+            XDG_DESKTOP_PATH.write_text(desktop_contents)
+            logger.info(f"XDG autostart file written to {XDG_DESKTOP_PATH}")
+        except Exception as exc:
+            logger.warning(f"Failed to write XDG autostart desktop file: {exc}")
+            return False
 
     # 4. Save state to config
     try:
@@ -200,62 +219,7 @@ def run_startup_reseat_and_launch(
 ) -> int:
     """
     Executed on system boot / power recovery.
-    Loops start_session with exponential backoff on retryable failures.
-    Polls for a stop request using a threading.Event set by SIGTERM/SIGINT handlers.
-    When stopped by signal, calls stop_session and returns 0.
-    Returns 1 if startup encounters an unrecoverable error.
+    Delegates to the central supervisor.
     """
-    from core.session_manager import session_mgr, StartResult
-    from core.hotkey_manager import HotkeyManager
-
-    logger.info("Starting automated power outage recovery / boot reseating sequence...")
-
-    stop = stop_event or threading.Event()
-    if threading.current_thread() is threading.main_thread():
-        try:
-            for sig in (signal.SIGINT, signal.SIGTERM):
-                signal.signal(sig, lambda *_: stop.set())
-        except Exception as exc:
-            logger.debug(f"Could not register signal handlers: {exc}")
-
-    delay = 2
-    res = None
-    while not stop.is_set():
-        res = session_mgr.start_session(on_event=logger.info)
-        if res.ok:
-            break
-        if res.code in (StartResult.NEED_DISPLAYS, StartResult.NEED_DEVICES, StartResult.KIOSK_FAILED):
-            logger.warning(f"Startup attempt failed ({res.code}: {res.message}), retrying in {delay}s...")
-            sleep_fn(delay)
-            delay = min(delay * 2, 60)
-        else:
-            logger.error(f"Startup unrecoverable error ({res.code}): {res.message}")
-            return 1
-
-    if stop.is_set():
-        session_mgr.stop_session(exit_gui=True, on_event=logger.info)
-        return 0
-
-    if not res or not res.ok:
-        logger.error(f"Failed to launch kiosks on startup: {res.message if res else 'Unknown'}")
-        return 1
-
-    logger.info("Dual kiosks launched successfully on startup!")
-    session_mgr.hotkey_mgr = HotkeyManager(launch_gui_if_needed=True, seat_keyboards=session_mgr.engine.seat_keyboards)
-    session_mgr.hotkey_mgr.start()
-    logger.info("Super Keyboard Shortcut (Ctrl+Shift+M+S) listener active for kiosk overlay.")
-
-    try:
-        while not stop.is_set():
-            time.sleep(2)
-            seats = session_mgr.cfg_mgr.load_config().get("seats", [])
-            reseated = session_mgr.engine.check_and_reseat_hotplugged_devices(seats)
-            if reseated:
-                for m in reseated:
-                    logger.info(f"[Autostart Hotplug Reseat] {m}")
-    except (KeyboardInterrupt, SystemExit):
-        stop.set()
-
-    logger.info("Stopping kiosks, display guard, hotkey listener and resetting seating...")
-    session_mgr.stop_session(exit_gui=True, on_event=logger.info)
-    return 0
+    from core.supervisor import run
+    return run(sleep_fn=sleep_fn, stop_event=stop_event)

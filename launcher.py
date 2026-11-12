@@ -123,82 +123,8 @@ def acquire_lock():
 
 
 def launch(args) -> int:
-    missing = [c for c in REQUIRED if not shutil.which(c)]
-    if missing:
-        notify(f"Missing tools: {', '.join(missing)}. Install them and try again.", urgent=True)
-        return 1
-
-    if not os.environ.get("DISPLAY"):
-        os.environ["DISPLAY"] = ":0"
-
-    if args.restart or args.reassign:
-        if _read_pid():
-            cmd_stop()
-            time.sleep(1)
-
-    lock = acquire_lock()
-    if lock is None:
-        notify("Kiosks are already running - opening the Control Board.")
-        return cmd_control_board(args.seat)
-
-    from core.session_manager import session_mgr
-    from core.hotkey_manager import HotkeyManager, send_overlay_command
-
-    stop = threading.Event()
-    for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
-        signal.signal(sig, lambda *_: stop.set())
-
-    signal.signal(signal.SIGUSR1, lambda *_: session_mgr.reseat_session(hard=False, on_event=notify))
-    signal.signal(signal.SIGUSR2, lambda *_: session_mgr.reseat_session(hard=True, on_event=notify))
-
-    gui_proc = None
-    try:
-        ok, msg = session_mgr.start_session(
-            reassign=args.reassign,
-            no_detect=args.no_detect,
-            on_event=notify,
-        )
-        if not ok:
-            notify(msg, urgent=True)
-            return 1
-
-        # Bind GUI startup: spawn the Control Board GUI alongside the desktop session
-        if not send_overlay_command("NOP"):
-            gui_proc = spawn_control_board(args.seat, start_hidden=True)
-
-        notify("Kiosks running. Ctrl+Shift+M+S opens the Control Board." if ok
-               else f"A kiosk failed to start - see {LOG_FILE}", urgent=not ok)
-
-        gui_until = [0.0]
-        def on_hotkey(seat_id, _master, _slave):
-            if send_overlay_command("NOP"):
-                return
-            if time.time() > gui_until[0]:
-                gui_until[0] = time.time() + 8
-                spawn_control_board(seat_id)
-
-        session_mgr.hotkey_mgr = HotkeyManager(on_trigger=on_hotkey, seat_keyboards=session_mgr.engine.seat_keyboards)
-        session_mgr.hotkey_mgr.start()
-
-        last_hotplug = 0.0
-        while not stop.wait(0.4):
-            if gui_proc is not None and gui_proc.poll() is not None:
-                log.info("Bound Control Board GUI exited; stopping desktop session.")
-                break
-            if time.time() - last_hotplug >= 1.5:
-                last_hotplug = time.time()
-                for msg in session_mgr.engine.check_and_reseat_hotplugged_devices(
-                    session_mgr.cfg_mgr.load_config().get("seats", [])
-                ):
-                    notify(msg)
-        return 0
-    except Exception as exc:
-        log.exception("Launcher failed")
-        notify(f"Launcher failed: {exc}", urgent=True)
-        return 1
-    finally:
-        log.info("Shutting down launcher session...")
-        session_mgr.stop_session(exit_gui=True, on_event=log.info)
+    from core.supervisor import run
+    return run(args)
 
 
 def main():

@@ -45,7 +45,8 @@ def test_autostart_retries_with_exponential_backoff():
         def trigger_stop():
             stop_evt.set()
 
-        with patch("core.hotkey_manager.HotkeyManager") as mock_hk:
+        with patch("core.supervisor.spawn_control_board"), \
+             patch("core.supervisor.HotkeyManager") as mock_hk:
             instance = mock_hk.return_value
             instance.start.side_effect = trigger_stop
             

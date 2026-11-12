@@ -258,7 +258,6 @@ class SessionManager:
 
         try:
             PID_FILE.unlink(missing_ok=True)
-            LOCK_FILE.unlink(missing_ok=True)
         except Exception:
             pass
 

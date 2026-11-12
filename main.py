@@ -67,7 +67,8 @@ def run_cli(args):
     if args.auto_start:
         # Automated boot / power outage recovery sequence
         print("[*] Running automatic boot & reseating sequence...")
-        rc = run_startup_reseat_and_launch()
+        from launcher import launch
+        rc = launch(args)
         if rc != 0:
             sys.exit(1)
         return
@@ -160,29 +161,11 @@ def run_cli(args):
         return
 
     if args.start:
-        ok, msg = session_mgr.start_session(on_event=lambda m: print(f"[*] {m}"))
-        if ok:
-            print("[✓] Dual Firefox kiosks launched successfully!")
-            from core.hotkey_manager import HotkeyManager
-            session_mgr.hotkey_mgr = HotkeyManager(launch_gui_if_needed=True, seat_keyboards=engine.seat_keyboards)
-            session_mgr.hotkey_mgr.start()
-            print("    ⌨ Super Shortcut: Press Ctrl+Shift+M+S on any seat to overlay the control board.")
-            print("    Press Ctrl+C to stop kiosks and reset seating.")
-            try:
-                import time
-                while True:
-                    time.sleep(2)
-                    seats = cfg_mgr.load_config().get("seats", [])
-                    reseated = engine.check_and_reseat_hotplugged_devices(seats)
-                    if reseated:
-                        for m in reseated:
-                            print(f"[✓] Hotplug: {m}")
-            except KeyboardInterrupt:
-                print("\n[*] Stopping kiosks, display guard, hotkey listener and resetting devices...")
-                session_mgr.stop_session(exit_gui=True, on_event=lambda m: print(f"[*] {m}"))
-                print("[✓] Cleanup complete.")
-        else:
-            print(f"[✗] {msg}")
+        print("[*] Starting dual-seat kiosk supervisor...")
+        from launcher import launch
+        rc = launch(args)
+        if rc != 0:
+            sys.exit(1)
         return
 
 
