@@ -18,9 +18,11 @@ from typing import Optional
 from core import overlay_state
 from core.session_manager import session_mgr, get_supervisor_pid
 from core.hotkey_manager import OverlayIPCServer, get_seat_screen_geometry
+from core.logging_setup import setup_logging
 from gui.styles import CSS_STYLES
 from gui.tabs import DashboardTab, SeatsTab, DevicesTab, TestTab, ConfigTab
 
+setup_logging()
 logger = logging.getLogger("xinput_seating.app")
 
 

@@ -19,11 +19,8 @@ os.environ.setdefault("GDK_BACKEND", "x11")
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 # Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    datefmt="%H:%M:%S",
-)
+from core.logging_setup import setup_logging
+setup_logging()
 logger = logging.getLogger("xinput_seating")
 
 

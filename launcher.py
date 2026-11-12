@@ -31,14 +31,9 @@ PROJECT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(PROJECT_DIR))
 
 from core.paths import CONFIG_DIR, LOCK_FILE, PID_FILE, LOG_FILE, STATE_DIR, ensure_state_dir
+from core.logging_setup import setup_logging
 
-ensure_state_dir()
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    datefmt="%H:%M:%S",
-    handlers=[logging.FileHandler(LOG_FILE), logging.StreamHandler()],
-)
+setup_logging()
 log = logging.getLogger("launcher")
 
 REQUIRED = ["xinput", "xrandr", "firefox", "wmctrl", "xdotool"]

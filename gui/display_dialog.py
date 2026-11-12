@@ -37,7 +37,9 @@ if str(PROJECT_DIR) not in sys.path:
 
 from core import overlay_state
 from core.device_manager import DeviceManager
+from core.logging_setup import setup_logging
 
+setup_logging()
 logger = logging.getLogger("xinput_seating.display_dialog")
 
 DIALOG_CSS = b"""
