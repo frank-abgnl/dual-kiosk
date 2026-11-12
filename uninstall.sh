@@ -28,8 +28,8 @@ for a in "$@"; do
 done
 
 main() {
-    export PYTHONPATH="${SCRIPT_DIR}:${PYTHONPATH:-}"
-    python3 "${SCRIPT_DIR}/main.py" --uninstall "${PASS[@]}" || return $?
+    export PYTHONPATH="${SCRIPT_DIR}${PYTHONPATH:+:$PYTHONPATH}"
+    python3 "${SCRIPT_DIR}/main.py" --uninstall ${PASS[@]+"${PASS[@]}"} || return $?
 
     if [ "$REMOVE_PROJECT" -eq 1 ] && [ "$DRY" -eq 0 ]; then
         if [ "$ASSUME_YES" -eq 1 ]; then
