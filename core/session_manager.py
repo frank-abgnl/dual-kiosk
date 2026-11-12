@@ -397,16 +397,6 @@ class SessionManager:
             _emit("Failed to launch one or more Firefox kiosks.")
             return StartResult(ok=False, code=StartResult.KIOSK_FAILED, message="Failed to launch Firefox kiosks.")
 
-    def start_session_legacy(
-        self,
-        reassign: bool = False,
-        no_detect: bool = False,
-        on_event: Optional[Callable[[str], None]] = None,
-        allow_partial: Optional[bool] = None,
-    ) -> Tuple[bool, str]:
-        res = self.start_session(reassign=reassign, no_detect=no_detect, on_event=on_event, allow_partial=allow_partial)
-        return res.ok, res.message
-
     def restart_session(
         self,
         reassign: bool = False,
