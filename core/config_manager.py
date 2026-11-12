@@ -132,56 +132,26 @@ class ConfigManager:
         return res
 
     def get_default_config(self) -> Dict:
-        """Returns the default configuration template."""
-        return {
-            "version": "1.0",
-            "seats": [
-                {
-                    "id": "seat1",
-                    "name": "Seat 1 (Primary)",
-                    "is_primary": True,
-                    "display": "eDP-1",
-                    "mouse_id": None,
-                    "mouse_name": "",
-                    "mouse_port": None,
-                    "keyboard_id": None,
-                    "keyboard_name": "",
-                    "keyboard_port": None,
-                    "lock_peripherals": True,
-                    "locked_display": "eDP-1",
-                    "profile_name": "seat1",
-                    "kiosk_url": "https://duckduckgo.com",
-                    "lock_kiosk": True,
-                    "auto_respawn": True,
-                },
-                {
-                    "id": "seat2",
-                    "name": "Seat 2 (Secondary)",
-                    "is_primary": False,
-                    "display": "HDMI-1",
-                    "mouse_id": None,
-                    "mouse_name": "",
-                    "mouse_port": None,
-                    "keyboard_id": None,
-                    "keyboard_name": "",
-                    "keyboard_port": None,
-                    "lock_peripherals": True,
-                    "locked_display": "HDMI-1",
-                    "profile_name": "seat2",
-                    "kiosk_url": "https://www.google.com",
-                    "lock_kiosk": True,
-                    "auto_respawn": True,
-                },
-            ],
-            "settings": {
-                "auto_start_kiosks": True,
-                "confine_mouse_to_screen": True,
-                "watchdog_interval_sec": 1.5,
-                "lock_peripherals_to_displays": True,
-                "hotplug_auto_reseat": True,
-                "idle_reset_minutes": 0,
-            },
-        }
+        """Returns the default configuration template from core.schema."""
+        from core.schema import get_default_config as schema_default
+        return schema_default()
+
+    def reset_to_defaults(self) -> Dict:
+        """
+        Resets configuration to factory defaults.
+        Guarantees that a backup (.bak) of the current configuration is written first.
+        """
+        if self.config_path.exists():
+            bak_path = self.config_path.with_name(self.config_path.name + ".bak")
+            try:
+                shutil.copy2(str(self.config_path), str(bak_path))
+                logger.info(f"Backed up config to {bak_path} before resetting to defaults.")
+            except Exception as exc:
+                logger.warning(f"Could not create backup before reset: {exc}")
+
+        default_cfg = self.get_default_config()
+        self.save_config(default_cfg)
+        return default_cfg
 
     def load_config(self, include_runtime: bool = True) -> Dict:
         """Loads configuration from JSON file or returns default if not present."""
@@ -325,22 +295,6 @@ class ConfigManager:
         return cfg
 
     def validate_config(self, cfg: Dict) -> List[str]:
-        """Validates configuration and returns a list of issues (empty if valid)."""
-        issues = []
-        if not isinstance(cfg, dict):
-            return ["Root config must be a JSON object"]
-
-        seats = cfg.get("seats", [])
-        if not isinstance(seats, list) or len(seats) < 2:
-            issues.append("Config should have at least 2 seats defined.")
-
-        for idx, seat in enumerate(seats):
-            sid = seat.get("id", f"Seat #{idx+1}")
-            if not seat.get("display"):
-                issues.append(f"[{sid}] Missing target display.")
-            if seat.get("mouse_id") is None:
-                issues.append(f"[{sid}] No mouse ID assigned.")
-            if seat.get("keyboard_id") is None:
-                issues.append(f"[{sid}] No keyboard ID assigned.")
-
-        return issues
+        """Validates configuration and returns a list of error strings."""
+        from core.schema import validate
+        return [str(err) for err in validate(cfg)]

@@ -107,9 +107,10 @@ class ConfigTab(Gtk.Box):
             self.app.show_info(f"JSON Parse Error: {err}", 1)
             return
 
-        issues = self.app.config_mgr.validate_config(parsed)
+        from core.schema import validate
+        issues = validate(parsed)
         if issues:
-            msg = "Validation warnings:\n• " + "\n• ".join(issues)
+            msg = "Validation issues:\n• " + "\n• ".join(f"[{e.path}] {e.message}" for e in issues)
             self.app.show_info(msg, 1)
         else:
             self.app.show_info("Config validation passed successfully ✓", 0)
@@ -129,12 +130,11 @@ class ConfigTab(Gtk.Box):
             buttons=Gtk.ButtonsType.YES_NO,
             text="Reset to default configuration?",
         )
-        dlg.format_secondary_text("This will overwrite existing seat assignments with factory defaults.")
+        dlg.format_secondary_text("This will backup current settings to config.json.bak and reset to defaults.")
         resp = dlg.run()
         dlg.destroy()
         if resp == Gtk.ResponseType.YES:
-            default_cfg = self.app.config_mgr.get_default_config()
-            self.app.config_mgr.save_config(default_cfg)
+            self.app.config_mgr.reset_to_defaults()
             self.reload_file()
             self.app.seats_tab.refresh()
-            self.app.show_info("Configuration reset to defaults.", 0)
+            self.app.show_info("Configuration reset to defaults (backup saved to config.json.bak).", 0)
