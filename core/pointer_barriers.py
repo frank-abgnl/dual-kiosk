@@ -12,10 +12,11 @@ long as this process (GUI or `--start` CLI) stays running.
 """
 
 import ctypes
-import ctypes.util
 import logging
 import threading
 from typing import Dict, List, Optional, Tuple
+
+from core.x11 import load_x11, open_display
 
 logger = logging.getLogger("xinput_seating.barriers")
 
@@ -36,40 +37,8 @@ class PointerConfiner:
         if self._dpy:
             return True
         try:
-            x11 = ctypes.CDLL(ctypes.util.find_library("X11") or "libX11.so.6")
-            xfixes = ctypes.CDLL(ctypes.util.find_library("Xfixes") or "libXfixes.so.3")
-            xi = ctypes.CDLL(ctypes.util.find_library("Xi") or "libXi.so.6")
-
-            x11.XInitThreads.restype = ctypes.c_int
-            x11.XInitThreads()
-            x11.XOpenDisplay.restype = ctypes.c_void_p
-            x11.XOpenDisplay.argtypes = [ctypes.c_char_p]
-            x11.XDefaultRootWindow.restype = ctypes.c_ulong
-            x11.XDefaultRootWindow.argtypes = [ctypes.c_void_p]
-            x11.XFlush.argtypes = [ctypes.c_void_p]
-            x11.XSync.argtypes = [ctypes.c_void_p, ctypes.c_int]
-
-            xfixes.XFixesQueryVersion.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int)]
-            xfixes.XFixesCreatePointerBarrier.restype = ctypes.c_ulong
-            xfixes.XFixesCreatePointerBarrier.argtypes = [
-                ctypes.c_void_p, ctypes.c_ulong,
-                ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
-                ctypes.c_int, ctypes.c_int, ctypes.POINTER(ctypes.c_int),
-            ]
-            xfixes.XFixesDestroyPointerBarrier.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
-
-            xi.XIWarpPointer.argtypes = [
-                ctypes.c_void_p, ctypes.c_int, ctypes.c_ulong, ctypes.c_ulong,
-                ctypes.c_double, ctypes.c_double, ctypes.c_uint, ctypes.c_uint,
-                ctypes.c_double, ctypes.c_double,
-            ]
-
-            xi.XISetClientPointer.restype = ctypes.c_int
-            xi.XISetClientPointer.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.c_int]
-            xi.XISetFocus.restype = ctypes.c_int
-            xi.XISetFocus.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_ulong, ctypes.c_ulong]
-
-            dpy = x11.XOpenDisplay(None)
+            x11, xi, xfixes = load_x11()
+            dpy = open_display()
             if not dpy:
                 logger.error("Pointer barriers: cannot open X display (is DISPLAY set / are you on X11?).")
                 return False

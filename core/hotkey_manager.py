@@ -22,6 +22,14 @@ from typing import Callable, Dict, List, Optional, Set, Tuple
 logger = logging.getLogger("xinput_seating.hotkey")
 
 from core.paths import SOCKET_PATH
+from core.x11 import (
+    _XEvent,
+    _XGenericEventCookie,
+    _XIEventMask,
+    _XIRawEvent,
+    load_x11,
+    open_display,
+)
 PROJECT_DIR = Path(__file__).resolve().parent.parent
 MAIN_PY = PROJECT_DIR / "main.py"
 
@@ -237,52 +245,7 @@ def get_seat_screen_geometry(
     return 0, 0, 1024, 768, "default"
 
 
-# ---------------------------------------------------------------------------
-# XInput 2 Ctypes Structures
-# ---------------------------------------------------------------------------
-class _XIEventMask(ctypes.Structure):
-    _fields_ = [
-        ("deviceid", ctypes.c_int),
-        ("mask_len", ctypes.c_int),
-        ("mask", ctypes.POINTER(ctypes.c_ubyte)),
-    ]
 
-
-class _XGenericEventCookie(ctypes.Structure):
-    _fields_ = [
-        ("type", ctypes.c_int),
-        ("serial", ctypes.c_ulong),
-        ("send_event", ctypes.c_int),
-        ("display", ctypes.c_void_p),
-        ("extension", ctypes.c_int),
-        ("evtype", ctypes.c_int),
-        ("cookie", ctypes.c_uint),
-        ("data", ctypes.c_void_p),
-    ]
-
-
-class _XIRawEvent(ctypes.Structure):
-    _fields_ = [
-        ("type", ctypes.c_int),
-        ("serial", ctypes.c_ulong),
-        ("send_event", ctypes.c_int),
-        ("display", ctypes.c_void_p),
-        ("extension", ctypes.c_int),
-        ("evtype", ctypes.c_int),
-        ("time", ctypes.c_ulong),
-        ("deviceid", ctypes.c_int),
-        ("sourceid", ctypes.c_int),
-        ("detail", ctypes.c_int),  # Keycode
-        ("flags", ctypes.c_int),
-    ]
-
-
-class _XEvent(ctypes.Union):
-    _fields_ = [
-        ("type", ctypes.c_int),
-        ("xcookie", _XGenericEventCookie),
-        ("pad", ctypes.c_long * 24),
-    ]
 
 
 # ---------------------------------------------------------------------------
@@ -426,57 +389,14 @@ class HotkeyManager:
     def _listener_loop(self):
         """XInput 2 raw event polling loop."""
         try:
-            x11 = ctypes.CDLL(ctypes.util.find_library("X11") or "libX11.so.6")
-            xi = ctypes.CDLL(ctypes.util.find_library("Xi") or "libXi.so.6")
-
-            x11.XInitThreads.restype = ctypes.c_int
-            x11.XInitThreads()
-
-            x11.XOpenDisplay.restype = ctypes.c_void_p
-            x11.XOpenDisplay.argtypes = [ctypes.c_char_p]
-            dpy = x11.XOpenDisplay(None)
+            x11, xi, _ = load_x11()
+            dpy = open_display()
             if not dpy:
                 logger.error("Hotkey listener: Cannot open X11 Display.")
                 return
 
-            x11.XDefaultRootWindow.restype = ctypes.c_ulong
-            x11.XDefaultRootWindow.argtypes = [ctypes.c_void_p]
             root = x11.XDefaultRootWindow(dpy)
-
-            x11.XConnectionNumber.restype = ctypes.c_int
-            x11.XConnectionNumber.argtypes = [ctypes.c_void_p]
             fd = x11.XConnectionNumber(dpy)
-
-            x11.XPending.restype = ctypes.c_int
-            x11.XPending.argtypes = [ctypes.c_void_p]
-
-            x11.XKeycodeToKeysym.restype = ctypes.c_ulong
-            x11.XKeycodeToKeysym.argtypes = [ctypes.c_void_p, ctypes.c_ubyte, ctypes.c_int]
-
-            x11.XGetEventData.restype = ctypes.c_int
-            x11.XGetEventData.argtypes = [ctypes.c_void_p, ctypes.POINTER(_XGenericEventCookie)]
-            x11.XFreeEventData.argtypes = [ctypes.c_void_p, ctypes.POINTER(_XGenericEventCookie)]
-            x11.XNextEvent.argtypes = [ctypes.c_void_p, ctypes.POINTER(_XEvent)]
-
-            xi.XISelectEvents.restype = ctypes.c_int
-            xi.XISelectEvents.argtypes = [
-                ctypes.c_void_p,
-                ctypes.c_ulong,
-                ctypes.POINTER(_XIEventMask),
-                ctypes.c_int,
-            ]
-
-            x11.XCloseDisplay.argtypes = [ctypes.c_void_p]
-            x11.XFlush.argtypes = [ctypes.c_void_p]
-
-            x11.XQueryExtension.restype = ctypes.c_int
-            x11.XQueryExtension.argtypes = [
-                ctypes.c_void_p,
-                ctypes.c_char_p,
-                ctypes.POINTER(ctypes.c_int),
-                ctypes.POINTER(ctypes.c_int),
-                ctypes.POINTER(ctypes.c_int),
-            ]
 
             # Query XInput extension opcode
             xi_opcode = ctypes.c_int(0)
