@@ -25,12 +25,7 @@ from typing import Callable, Dict, List, Optional, Tuple
 
 logger = logging.getLogger("xinput_seating.session")
 
-CONFIG_DIR = Path.home() / ".config" / "xinput-seats"
-PID_FILE = CONFIG_DIR / "launcher.pid"
-LOCK_FILE = CONFIG_DIR / "launcher.lock"
-LOG_FILE = CONFIG_DIR / "launcher.log"
-
-CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+from core.paths import CONFIG_DIR, PID_FILE, LOCK_FILE, LOG_FILE, PROFILES_DIR
 
 
 def _pid_alive(pid: int) -> bool:
@@ -218,7 +213,7 @@ class SessionManager:
 
         # Double check with pkill -f for isolated profile dirs
         try:
-            prof_dir = str(Path.home() / ".config" / "xinput-seats" / "profiles")
+            prof_dir = str(PROFILES_DIR)
             subprocess.run(["pkill", "-9", "-f", prof_dir], capture_output=True)
         except Exception:
             pass

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Configuration Manager for XInput Pseudo-Seating.
-Stores and validates JSON configurations at ~/.config/xinput-seats/config.json.
+Stores and validates JSON configurations.
 """
 
 import json
@@ -11,8 +11,7 @@ from typing import Dict, List, Optional
 
 logger = logging.getLogger("xinput_seating.config")
 
-CONFIG_DIR = Path.home() / ".config" / "xinput-seats"
-CONFIG_FILE = CONFIG_DIR / "config.json"
+from core.paths import CONFIG_DIR, CONFIG_FILE
 
 
 class ConfigManager:
@@ -21,7 +20,6 @@ class ConfigManager:
     def __init__(self, config_path: Optional[Path] = None):
         self.config_path = config_path or CONFIG_FILE
         self.config_dir = self.config_path.parent
-        self.config_dir.mkdir(parents=True, exist_ok=True)
 
     def get_default_config(self) -> Dict:
         """Returns the default configuration template."""

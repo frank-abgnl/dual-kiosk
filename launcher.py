@@ -30,12 +30,9 @@ from pathlib import Path
 PROJECT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(PROJECT_DIR))
 
-CONFIG_DIR = Path.home() / ".config" / "xinput-seats"
-LOCK_FILE = CONFIG_DIR / "launcher.lock"
-PID_FILE = CONFIG_DIR / "launcher.pid"
-LOG_FILE = CONFIG_DIR / "launcher.log"
+from core.paths import CONFIG_DIR, LOCK_FILE, PID_FILE, LOG_FILE, STATE_DIR, ensure_state_dir
 
-CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+ensure_state_dir()
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -170,7 +167,7 @@ def launch(args) -> int:
             gui_proc = spawn_control_board(args.seat, start_hidden=True)
 
         notify("Kiosks running. Ctrl+Shift+M+S opens the Control Board." if ok
-               else "A kiosk failed to start - see ~/.config/xinput-seats/launcher.log", urgent=not ok)
+               else f"A kiosk failed to start - see {LOG_FILE}", urgent=not ok)
 
         gui_until = [0.0]
         def on_hotkey(seat_id, _master, _slave):

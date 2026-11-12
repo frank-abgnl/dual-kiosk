@@ -19,8 +19,7 @@ from core import overlay_state
 
 logger = logging.getLogger("xinput_seating.kiosk")
 
-CONFIG_DIR = Path.home() / ".config" / "xinput-seats"
-PROFILES_DIR = CONFIG_DIR / "profiles"
+from core.paths import CONFIG_DIR, PROFILES_DIR
 
 
 def run_command(args, timeout=5):

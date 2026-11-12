@@ -34,7 +34,9 @@ from typing import Dict, List, Optional, Tuple
 
 logger = logging.getLogger("xinput_seating.resolver")
 
-STATE_FILE = Path.home() / ".config" / "xinput-seats" / "peripheral_state.json"
+from core.paths import STATE_DIR
+
+STATE_FILE = STATE_DIR / "peripheral_state.json"
 
 CORE = {"pointer": 2, "keyboard": 3}
 KEYS = {

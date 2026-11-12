@@ -27,8 +27,7 @@ logger = logging.getLogger("xinput_seating.uninstall")
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 MAIN_PY = PROJECT_ROOT / "main.py"
-CONFIG_DIR = Path.home() / ".config" / "xinput-seats"
-PROFILES_DIR = CONFIG_DIR / "profiles"
+from core.paths import CONFIG_DIR, PROFILES_DIR, STATE_DIR
 
 DESKTOP_NAMES = ("xinput-multiseat.desktop", "xinput-kiosk-launcher.desktop", "dual-kiosk.desktop")
 LAUNCHER_FILES = [
@@ -185,6 +184,7 @@ class Uninstaller:
             self._say(f"    Keeping {CONFIG_DIR} (--keep-config).")
         else:
             self._remove(CONFIG_DIR)
+            self._remove(STATE_DIR)
 
         systemd_dir = Path.home() / ".config" / "systemd" / "user"
         for unit in SYSTEMD_UNITS:

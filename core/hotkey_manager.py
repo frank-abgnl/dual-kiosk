@@ -21,8 +21,7 @@ from typing import Callable, Dict, List, Optional, Set, Tuple
 
 logger = logging.getLogger("xinput_seating.hotkey")
 
-CONFIG_DIR = Path.home() / ".config" / "xinput-seats"
-SOCKET_PATH = CONFIG_DIR / "overlay.sock"
+from core.paths import SOCKET_PATH
 PROJECT_DIR = Path(__file__).resolve().parent.parent
 MAIN_PY = PROJECT_DIR / "main.py"
 
@@ -76,7 +75,7 @@ class OverlayIPCServer:
         self._stop_event = threading.Event()
 
     def start(self):
-        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        SOCKET_PATH.parent.mkdir(parents=True, exist_ok=True)
         try:
             SOCKET_PATH.unlink(missing_ok=True)
         except Exception:

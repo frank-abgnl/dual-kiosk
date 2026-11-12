@@ -31,8 +31,7 @@ from core import overlay_state
 
 logger = logging.getLogger("xinput_seating.shield")
 
-CONFIG_DIR = Path.home() / ".config" / "xinput-seats"
-KEYMAP_DIR = CONFIG_DIR / "keymaps"
+from core.paths import KEYMAP_DIR
 
 DEFAULT_IGNORE_CLASSES = ("xscreensaver", "light-locker", "i3lock", "kscreenlocker",
                           "gnome-screensaver", "slock", "xsecurelock")
