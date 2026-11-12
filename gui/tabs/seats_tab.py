@@ -55,16 +55,28 @@ class SeatCard(Gtk.Frame):
         lbl_mouse.set_halign(Gtk.Align.END)
         grid.attach(lbl_mouse, 0, 1, 1, 1)
 
+        m_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
         self.combo_mouse = Gtk.ComboBoxText()
-        grid.attach(self.combo_mouse, 1, 1, 1, 1)
+        m_box.pack_start(self.combo_mouse, True, True, 0)
+        self.lbl_mouse_port = Gtk.Label(label="")
+        m_box.pack_start(self.lbl_mouse_port, False, False, 0)
+        self.chk_bind_mouse_port = Gtk.CheckButton(label="Bind to this USB port")
+        m_box.pack_start(self.chk_bind_mouse_port, False, False, 0)
+        grid.attach(m_box, 1, 1, 1, 1)
 
         # Row 2: Keyboard
         lbl_kbd = Gtk.Label(label="Assigned Keyboard:")
         lbl_kbd.set_halign(Gtk.Align.END)
         grid.attach(lbl_kbd, 0, 2, 1, 1)
 
+        k_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
         self.combo_kbd = Gtk.ComboBoxText()
-        grid.attach(self.combo_kbd, 1, 2, 1, 1)
+        k_box.pack_start(self.combo_kbd, True, True, 0)
+        self.lbl_kbd_port = Gtk.Label(label="")
+        k_box.pack_start(self.lbl_kbd_port, False, False, 0)
+        self.chk_bind_kbd_port = Gtk.CheckButton(label="Bind to this USB port")
+        k_box.pack_start(self.chk_bind_kbd_port, False, False, 0)
+        grid.attach(k_box, 1, 2, 1, 1)
 
         # Row 3: Peripheral Locking to Display
         lbl_lock = Gtk.Label(label="Peripheral Lock:")
@@ -154,6 +166,16 @@ class SeatCard(Gtk.Frame):
         if pointers or selected_mouse_name:
             self.combo_mouse.set_active(active_mouse_idx)
 
+        # Mouse port display & binding
+        mouse_port = (pointers[active_mouse_idx].get("port") or pointers[active_mouse_idx].get("usb_path")) if active_mouse_idx < len(pointers) else ""
+        if mouse_port:
+            self.lbl_mouse_port.set_markup(f"<span size='small' color='#6b7280'>Port: <b>{mouse_port}</b></span>")
+            self.chk_bind_mouse_port.set_sensitive(True)
+        else:
+            self.lbl_mouse_port.set_markup("<span size='small' color='#6b7280'>Port: N/A</span>")
+            self.chk_bind_mouse_port.set_sensitive(False)
+        self.chk_bind_mouse_port.set_active(bool(current_cfg.get("mouse_port")))
+
         # 3. Keyboards (match by locked peripheral name first, then ID)
         self.combo_kbd.remove_all()
         selected_kbd_id = current_cfg.get("keyboard_id")
@@ -177,6 +199,16 @@ class SeatCard(Gtk.Frame):
 
         if keyboards or selected_kbd_name:
             self.combo_kbd.set_active(active_kbd_idx)
+
+        # Keyboard port display & binding
+        kbd_port = (keyboards[active_kbd_idx].get("port") or keyboards[active_kbd_idx].get("usb_path")) if active_kbd_idx < len(keyboards) else ""
+        if kbd_port:
+            self.lbl_kbd_port.set_markup(f"<span size='small' color='#6b7280'>Port: <b>{kbd_port}</b></span>")
+            self.chk_bind_kbd_port.set_sensitive(True)
+        else:
+            self.lbl_kbd_port.set_markup("<span size='small' color='#6b7280'>Port: N/A</span>")
+            self.chk_bind_kbd_port.set_sensitive(False)
+        self.chk_bind_kbd_port.set_active(bool(current_cfg.get("keyboard_port")))
 
         # 4. Peripheral Lock state & status badge
         is_locked = current_cfg.get("lock_peripherals", True)
@@ -235,6 +267,14 @@ class SeatCard(Gtk.Frame):
 
         lock_periph = self.chk_lock_peripherals.get_active()
 
+        mouse_port = None
+        if self.chk_bind_mouse_port.get_active() and mouse_idx >= 0 and mouse_idx < len(pointers):
+            mouse_port = pointers[mouse_idx].get("port") or pointers[mouse_idx].get("usb_path")
+
+        kbd_port = None
+        if self.chk_bind_kbd_port.get_active() and kbd_idx >= 0 and kbd_idx < len(keyboards):
+            kbd_port = keyboards[kbd_idx].get("port") or keyboards[kbd_idx].get("usb_path")
+
         return {
             "id": self.seat_id,
             "name": f"Seat {self.seat_index + 1} ({'Primary' if self.is_primary else 'Secondary'})",
@@ -242,8 +282,10 @@ class SeatCard(Gtk.Frame):
             "display": disp_name,
             "mouse_id": mouse_id,
             "mouse_name": mouse_name,
+            "mouse_port": mouse_port,
             "keyboard_id": kbd_id,
             "keyboard_name": kbd_name,
+            "keyboard_port": kbd_port,
             "lock_peripherals": lock_periph,
             "locked_display": disp_name if lock_periph else None,
             "profile_name": self.ent_profile.get_text().strip() or self.seat_id,

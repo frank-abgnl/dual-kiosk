@@ -40,8 +40,8 @@ STATE_FILE = STATE_DIR / "peripheral_state.json"
 
 CORE = {"pointer": 2, "keyboard": 3}
 KEYS = {
-    "pointer": ("mouse_name", "mouse_id", "mouse_ident"),
-    "keyboard": ("keyboard_name", "keyboard_id", "keyboard_ident"),
+    "pointer": ("mouse_name", "mouse_id", "mouse_ident", "mouse_port"),
+    "keyboard": ("keyboard_name", "keyboard_id", "keyboard_ident", "keyboard_port"),
 }
 
 PROMOTE_AFTER_SEC = 3 * 3600   # stand-in connected this long -> becomes the locked device
@@ -103,9 +103,21 @@ def mem_score(entry: Dict, cand: Dict) -> int:
     if entry.get("serial") and cand.get("serial"):
         return 50 if entry["serial"] == cand["serial"] else 0   # a different unit
     score = 20
-    if entry.get("usb_path") and entry["usb_path"] == cand.get("usb_path"):
+    epath = entry.get("usb_path") or entry.get("port")
+    cpath = cand.get("usb_path") or cand.get("port")
+    if epath and cpath and epath == cpath:
         score += 15                                              # same USB port = same position
     return score
+
+
+def port_matches(bound_port: Optional[str], cand_ident: Dict) -> bool:
+    """True if candidate matches the configured hardware USB physical port path."""
+    if not bound_port:
+        return False
+    bp = str(bound_port).strip().lower()
+    c_port = str(cand_ident.get("port") or "").strip().lower()
+    c_path = str(cand_ident.get("usb_path") or "").strip().lower()
+    return bp == c_port or bp == c_path or (bp != "" and (bp in c_path or c_port in bp))
 
 
 class PeripheralMemory:
@@ -190,15 +202,22 @@ class PeripheralResolver:
 
         def ident(c) -> Dict:
             if c["id"] not in cache:
-                raw = read_identity(c["id"])
-                cache[c["id"]] = {"name": c["name"], "product": raw["product"],
-                                  "usb_path": raw["usb_path"], "serial": raw["serial"]}
+                raw = read_identity(c["id"]) if ("usb_path" not in c and "port" not in c) else {}
+                usb_p = c.get("usb_path") or c.get("port") or raw.get("usb_path")
+                port_val = c.get("port") or (os.path.basename(usb_p) if usb_p else None)
+                cache[c["id"]] = {
+                    "name": c["name"],
+                    "product": c.get("product") or raw.get("product"),
+                    "usb_path": usb_p,
+                    "serial": c.get("serial") or raw.get("serial"),
+                    "port": port_val,
+                }
             return cache[c["id"]]
 
         with memory.lock:
             for cls in ("pointer", "keyboard"):
                 cands = all_cands[cls]
-                name_k, id_k, ident_k = KEYS[cls]
+                name_k, id_k, ident_k, port_k = KEYS[cls]
 
                 slots = []
                 for idx, s in enumerate(resolved):
@@ -210,11 +229,15 @@ class PeripheralResolver:
                     lid = s.get(ident_k) or {}
                     if lid and (lid.get("name") or "").strip().lower() != name:
                         lid = {}  # stale identity: the lock was changed by hand
+                    bound_port = s.get(port_k) or None
+                    if bound_port:
+                        bound_port = str(bound_port).strip()
                     mine = seat_masters.get(sid, {}).get(cls)
                     others = {m.get(cls) for osid, m in seat_masters.items()
                               if osid != sid and m.get(cls) not in (None, CORE[cls])}
                     slots.append({"idx": idx, "sid": sid, "seat": s, "name": name, "lid": lid,
-                                  "primary": s.get("is_primary", False), "mine": mine, "others": others})
+                                  "port": bound_port, "primary": s.get("is_primary", False),
+                                  "mine": mine, "others": others})
 
                 def attach_bonus(sl, c) -> int:
                     att, b = c.get("attachment"), 0
@@ -237,12 +260,29 @@ class PeripheralResolver:
                     recent = memory.slot(sl["sid"], cls)["recent"]
                     recent_names = {(e.get("name") or "").lower() for e in recent}
                     lid = sl["lid"]
+                    bound_port = sl.get("port")
+
                     for c in cands:
                         cname = c["name"].strip().lower()
+                        ci = ident(c)
+
+                        if bound_port:
+                            # Port binding is active: exact port matching is higher priority than name
+                            if port_matches(bound_port, ci):
+                                mem_best = 0
+                                for r, e in enumerate(recent):
+                                    m = mem_score(e, ci)
+                                    if m:
+                                        mem_best = max(mem_best, m - 2 * r)
+                                score, tier = 200 + mem_best, 0
+                                pairs.append((score + attach_bonus(sl, c), sl["idx"], c["id"], tier, c))
+                            # Candidates with different port do not match by lock when bound_port is set
+                            continue
+
+                        # Standard name and memory matching when port binding is off
                         by_lock = bool(sl["name"]) and cname == sl["name"]
                         if not (by_lock or cname in recent_names):
                             continue
-                        ci = ident(c)
                         if by_lock and lid:
                             if _prod(lid) and _prod(ci) and _prod(lid) != _prod(ci):
                                 by_lock = False
@@ -259,7 +299,7 @@ class PeripheralResolver:
                             score, tier = 100 + mem_best, 0
                             if lid.get("serial") and lid["serial"] == ci.get("serial"):
                                 score += 50
-                            if lid.get("usb_path") and lid["usb_path"] == ci.get("usb_path"):
+                            if lid.get("usb_path") and (lid["usb_path"] == ci.get("usb_path") or lid["usb_path"] == ci.get("port")):
                                 score += 20
                         else:
                             score, tier = 60 + mem_best, 1
@@ -318,6 +358,10 @@ class PeripheralResolver:
                     assignments[(sid, cls)] = c
                     s[id_k] = c["id"]
                     s[f"{cls}_connected"] = True
+                    if ci.get("port") or ci.get("usb_path"):
+                        s[f"{cls}_current_port"] = ci.get("port") or os.path.basename(str(ci.get("usb_path")))
+                    if sl.get("port"):
+                        s[port_k] = sl.get("port")
                     locked_name = s.get(name_k) or ""
                     sub = mslot.get("sub")
 

@@ -78,6 +78,7 @@ flowchart TD
     - **Seat 1:** Display 1 (Primary/leftmost) + First connected USB mouse + First connected USB keyboard.
     - **Seat 2:** Display 2 + Second connected USB mouse + Second connected USB keyboard.
     - Gracefully falls back to available input hardware if fewer than two USB pairs are present.
+    - **Identical Peripherals & USB Port Binding:** Two identical mouse/keyboard kits without hardware serial numbers are distinguished by their physical USB port path (e.g. `1-1.2`). The Seats tab provides a "Bind to this USB port" option to ensure identical devices stay permanently anchored to their intended seat regardless of reboot or plug order.
 - **Multi-Pointer X (MPX) Seating:**
   - Creates and manages secondary master pairs (`Seat_SEAT2 pointer` / `Seat_SEAT2 keyboard`).
   - Reattaches slave mice and keyboards (including sibling nodes like consumer control keys) to their designated seat masters.
