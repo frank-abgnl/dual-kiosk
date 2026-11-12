@@ -580,10 +580,10 @@ class DeviceManager:
 
         # Clean assignment from connected hardware
         m1 = pointers[0] if len(pointers) > 0 else None
-        m2 = pointers[1] if len(pointers) > 1 else (pointers[0] if pointers else None)
+        m2 = pointers[1] if len(pointers) > 1 else None
 
         k1 = keyboards[0] if len(keyboards) > 0 else None
-        k2 = keyboards[1] if len(keyboards) > 1 else (keyboards[0] if keyboards else None)
+        k2 = keyboards[1] if len(keyboards) > 1 else None
 
         assignment = {
             "seat1": {

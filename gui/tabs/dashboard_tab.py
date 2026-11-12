@@ -214,7 +214,7 @@ class DashboardTab(Gtk.Box):
 
         def _worker():
             from core.session_manager import session_mgr, StartResult
-            res = session_mgr.start_session(on_event=lambda m: self.append_log(m))
+            res = session_mgr.start_session(on_event=lambda m: self.append_log(m), allow_partial=True)
             if res.ok:
                 if self.app.hotkey_mgr:
                     GLib.idle_add(self.app.hotkey_mgr.update_seat_keyboards, self.app.seating_engine.seat_keyboards)
@@ -248,7 +248,7 @@ class DashboardTab(Gtk.Box):
         self.append_log("Restarting Firefox kiosks...")
         def _worker():
             from core.session_manager import session_mgr
-            session_mgr.restart_session(on_event=lambda m: self.append_log(m))
+            session_mgr.restart_session(on_event=lambda m: self.append_log(m), allow_partial=True)
             self.append_log("Dual kiosks restarted.")
             GLib.idle_add(self.refresh_metrics)
         threading.Thread(target=_worker, daemon=True).start()

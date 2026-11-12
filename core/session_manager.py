@@ -281,6 +281,7 @@ class SessionManager:
         reassign: bool = False,
         no_detect: bool = False,
         on_event: Optional[Callable[[str], None]] = None,
+        allow_partial: Optional[bool] = None,
     ) -> StartResult:
         """
         Unified start-up wrapper.
@@ -335,12 +336,31 @@ class SessionManager:
             s.pop("pointer_connected", None)
             s.pop("keyboard_connected", None)
         cfg["seats"] = resolved
+        seats = resolved
         self.cfg_mgr.save_config(cfg)
 
         for (sid, cls), dev in sorted(assignments.items()):
             seat = next((x for x in cfg["seats"] if x.get("id") == sid), {})
             _emit(f"  {sid} {cls}: " + (f"{dev['name']} (ID {dev['id']})" if dev else "not connected")
                   + f"   display={seat.get('display')}")
+
+        # Check for missing devices if partial seating is not allowed
+        missing_devs = []
+        for s in resolved:
+            sid = s.get("id", "seat")
+            if not s.get("mouse_id"):
+                missing_devs.append(f"{sid} mouse")
+            if not s.get("keyboard_id"):
+                missing_devs.append(f"{sid} keyboard")
+
+        effective_allow_partial = allow_partial
+        if effective_allow_partial is None:
+            effective_allow_partial = cfg.get("settings", {}).get("allow_partial_seats", False)
+
+        if missing_devs and not effective_allow_partial:
+            msg = f"Missing input device(s): {', '.join(missing_devs)}"
+            _emit(f"{msg}. Dual-seat kiosk requires dedicated mouse and keyboard for each seat.")
+            return StartResult(ok=False, code=StartResult.NEED_DEVICES, message=msg)
 
         # 3. Apply XInput pseudo-seating (MPX masters + confinement)
         _emit("Applying XInput MPX master pairs and device reattachments...")
@@ -373,19 +393,21 @@ class SessionManager:
         reassign: bool = False,
         no_detect: bool = False,
         on_event: Optional[Callable[[str], None]] = None,
+        allow_partial: Optional[bool] = None,
     ) -> Tuple[bool, str]:
-        res = self.start_session(reassign=reassign, no_detect=no_detect, on_event=on_event)
+        res = self.start_session(reassign=reassign, no_detect=no_detect, on_event=on_event, allow_partial=allow_partial)
         return res.ok, res.message
 
     def restart_session(
         self,
         reassign: bool = False,
         on_event: Optional[Callable[[str], None]] = None,
+        allow_partial: Optional[bool] = None,
     ) -> StartResult:
         """Stops any running session (without exiting the GUI) and starts a fresh session."""
         self.stop_session(exit_gui=False, on_event=on_event)
         time.sleep(0.5)
-        return self.start_session(reassign=reassign, no_detect=False, on_event=on_event)
+        return self.start_session(reassign=reassign, no_detect=False, on_event=on_event, allow_partial=allow_partial)
 
     def reseat_session(
         self,

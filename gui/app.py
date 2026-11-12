@@ -180,7 +180,7 @@ class XInputMultiseatApp(Gtk.ApplicationWindow):
         if not session_mgr.is_session_active():
             self.dashboard_tab.append_log("Auto-starting seating and dual Firefox kiosks with GUI startup...")
             def _worker():
-                res = session_mgr.start_session(on_event=lambda m: self.dashboard_tab.append_log(m))
+                res = session_mgr.start_session(on_event=lambda m: self.dashboard_tab.append_log(m), allow_partial=True)
                 if res.ok:
                     if self.hotkey_mgr:
                         GLib.idle_add(self.hotkey_mgr.update_seat_keyboards, self.seating_engine.seat_keyboards)

@@ -456,6 +456,9 @@ class XInputSeatingEngine:
             logger.error(f"Seat config conflict: {problem}")
             results[f"conflict: {problem}"] = False
 
+        used_mice: Set[int] = set()
+        used_keyboards: Set[int] = set()
+
         for seat in seats_config:
             seat_id = seat.get("id", "seat1")
             is_primary = seat.get("is_primary", False)
@@ -475,12 +478,22 @@ class XInputSeatingEngine:
                 master_kbd = kbd_id or f"{master_name} keyboard"
 
             if mouse_id:
-                results[f"{seat_id}_mouse"] = self.attach_with_siblings(mouse_id, master_ptr, "pointer")
-                if display_name:
-                    self.map_pointer_to_output(mouse_id, display_name)
+                if mouse_id in used_mice:
+                    logger.error(f"Refusing to seat mouse {mouse_id} on {seat_id}: already assigned to another seat.")
+                    results[f"{seat_id}_mouse"] = False
+                else:
+                    used_mice.add(mouse_id)
+                    results[f"{seat_id}_mouse"] = self.attach_with_siblings(mouse_id, master_ptr, "pointer")
+                    if display_name:
+                        self.map_pointer_to_output(mouse_id, display_name)
 
             if keyboard_id:
-                results[f"{seat_id}_keyboard"] = self.attach_with_siblings(keyboard_id, master_kbd, "keyboard")
+                if keyboard_id in used_keyboards:
+                    logger.error(f"Refusing to seat keyboard {keyboard_id} on {seat_id}: already assigned to another seat.")
+                    results[f"{seat_id}_keyboard"] = False
+                else:
+                    used_keyboards.add(keyboard_id)
+                    results[f"{seat_id}_keyboard"] = self.attach_with_siblings(keyboard_id, master_kbd, "keyboard")
 
             if isinstance(master_ptr, int):
                 self.seat_pointers[seat_id] = master_ptr
