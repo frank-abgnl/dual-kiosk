@@ -414,7 +414,11 @@ class SessionManager:
         hard: bool = False,
         on_event: Optional[Callable[[str], None]] = None,
     ) -> bool:
-        """Re-seats all devices of a running session (soft = keep browsers, hard = restart browsers)."""
+        """
+        Re-seats all devices of a running session.
+        Soft (hard=False): keeps kiosks running and hotplug-reseats devices without destroying masters.
+        Hard (hard=True): restarts kiosks and resets all seating from scratch.
+        """
         def _emit(msg: str):
             logger.info(msg)
             if on_event:
@@ -431,23 +435,30 @@ class SessionManager:
                 and all(p.poll() is None for p in self.kiosk.running_processes.values())
             )
             if hard or not alive:
-                ok, _ = self.restart_session(reassign=False, on_event=on_event)
-                return ok
+                _emit("Hard reseat requested or kiosks dead: restarting session...")
+                res = self.restart_session(reassign=False, on_event=on_event)
+                return res.ok
 
-            _emit("Re-seating all seats...")
-            self.engine.reset_all_to_core()
-            displays_now, total_now = self.dm.get_displays()
-            cfg_now = self.cfg_mgr.auto_generate_config(self.dm, force_reassign=False)
+            _emit("Soft re-seating devices (keeping browser kiosks running)...")
+            self.engine.force_recheck()
+            cfg_now = self.cfg_mgr.load_config()
             seats_now = cfg_now.get("seats", [])
-            seats_now, _ = self.dm.assign_displays_to_seats(seats_now, displays_now)
-            cfg_now["seats"] = seats_now
-            self.cfg_mgr.save_config(cfg_now)
-            self.engine.apply_seating(seats_now, displays_now, (total_now["width"], total_now["height"]))
-            if self.reseat_key:
-                self.reseat_key.update_seat_keyboards(self.engine.seat_keyboards)
+            displays_now, total_now = self.dm.get_displays()
+            total_geom = (total_now["width"], total_now["height"]) if total_now else None
+
+            msgs = self.engine.check_and_reseat_hotplugged_devices(
+                seats_now,
+                displays_info=displays_now,
+                total_screen=total_geom,
+            )
+            for m in msgs:
+                _emit(f"Reseat: {m}")
+
+            # Re-focus running kiosks to their seat keyboards
             for sid, win in list(self.kiosk.window_ids.items()):
                 self.engine.focus_seat_keyboard(sid, win)
-            _emit("Seats re-assigned.")
+
+            _emit("Soft re-seat complete.")
             return True
         except Exception as exc:
             logger.exception("Re-seat failed")

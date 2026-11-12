@@ -130,9 +130,11 @@ def run(
                 signal.signal(sig, lambda *_: stop.set())
             except Exception:
                 pass
+        reseat_flag = threading.Event()
+        hard_reseat_flag = threading.Event()
         try:
-            signal.signal(signal.SIGUSR1, lambda *_: session_mgr.reseat_session(hard=False, on_event=notify))
-            signal.signal(signal.SIGUSR2, lambda *_: session_mgr.reseat_session(hard=True, on_event=notify))
+            signal.signal(signal.SIGUSR1, lambda *_: reseat_flag.set())
+            signal.signal(signal.SIGUSR2, lambda *_: hard_reseat_flag.set())
         except Exception:
             pass
 
@@ -188,6 +190,13 @@ def run(
         # Monitoring and hotplug reseat loop
         last_hotplug = 0.0
         while not stop.wait(0.4):
+            if hard_reseat_flag.is_set():
+                hard_reseat_flag.clear()
+                session_mgr.reseat_session(hard=True, on_event=notify)
+            elif reseat_flag.is_set():
+                reseat_flag.clear()
+                session_mgr.reseat_session(hard=False, on_event=notify)
+
             if gui_proc is not None and gui_proc.poll() is not None:
                 gui_proc = None
             if time.time() - last_hotplug >= 1.5:

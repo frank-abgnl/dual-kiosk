@@ -63,6 +63,11 @@ class XInputSeatingEngine:
         self._last_reseat: Dict[Tuple[str, str], float] = {}
         self._absent: set = set()
 
+    def force_recheck(self):
+        """Clears topology verification cache and manual hold to force immediate reseat check."""
+        self._verified_sig = None
+        self.manual_hold_until = 0.0
+
     # -----------------------------------------------------------------------
     # Master Pair Management
     # -----------------------------------------------------------------------
