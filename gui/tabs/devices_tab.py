@@ -169,7 +169,8 @@ class DevicesTab(Gtk.Box):
         top.pack_start(Gtk.Separator(orientation=Gtk.Orientation.VERTICAL), False, False, 4)
 
         btn_refresh = Gtk.Button(label="🔄  Refresh All Devices")
-        btn_refresh.connect("clicked", lambda _: self.refresh())
+        self.btn_refresh = btn_refresh
+        btn_refresh.connect("clicked", lambda b: self.refresh(b))
         top.pack_start(btn_refresh, False, False, 0)
 
         btn_finder = Gtk.Button(label="🎯  Interactive Device Finder")
@@ -177,6 +178,7 @@ class DevicesTab(Gtk.Box):
         top.pack_start(btn_finder, False, False, 0)
 
         btn_reset = Gtk.Button(label="↩  Reset All to Virtual Core")
+        self.btn_reset = btn_reset
         btn_reset.connect("clicked", self._on_reset_all)
         top.pack_end(btn_reset, False, False, 0)
 
@@ -235,7 +237,7 @@ class DevicesTab(Gtk.Box):
             sid = s.get("id", "seat2")
             sname = s.get("name") or sid.capitalize()
             btn_ptr = Gtk.Button(label=f"Attach to {sname} Master")
-            btn_ptr.connect("clicked", lambda _, seat_id=sid: self._on_attach_ptr_seat(seat_id))
+            btn_ptr.connect("clicked", lambda b, seat_id=sid: self._on_attach_ptr_seat(b, seat_id))
             ptr_actions.pack_start(btn_ptr, False, False, 0)
 
         nb.append_page(ptr_box, Gtk.Label(label="🖱 Pointers & Mice"))
@@ -266,7 +268,7 @@ class DevicesTab(Gtk.Box):
             sid = s.get("id", "seat2")
             sname = s.get("name") or sid.capitalize()
             btn_kbd = Gtk.Button(label=f"Attach to {sname} Master")
-            btn_kbd.connect("clicked", lambda _, seat_id=sid: self._on_attach_kbd_seat(seat_id))
+            btn_kbd.connect("clicked", lambda b, seat_id=sid: self._on_attach_kbd_seat(b, seat_id))
             kbd_actions.pack_start(btn_kbd, False, False, 0)
 
         nb.append_page(kbd_box, Gtk.Label(label="⌨ Keyboards"))
@@ -301,18 +303,27 @@ class DevicesTab(Gtk.Box):
             tv.append_column(c)
         return tv
 
-    def refresh(self):
+    def refresh(self, btn=None):
         """Fetches all device data asynchronously."""
+        target_btn = btn or getattr(self, "btn_refresh", None)
+        if target_btn and hasattr(target_btn, "set_sensitive"):
+            target_btn.set_sensitive(False)
         threading.Thread(target=self._fetch_all_bg, daemon=True).start()
 
     def _fetch_all_bg(self):
-        displays, _ = self.app.device_mgr.get_displays()
-        masters, ptrs, kbds = self.app.device_mgr.get_xinput_hierarchy()
-        phys_devs = self.app.device_mgr.get_physical_input_devices()
+        try:
+            displays, _ = self.app.device_mgr.get_displays()
+            masters, ptrs, kbds = self.app.device_mgr.get_xinput_hierarchy()
+            phys_devs = self.app.device_mgr.get_physical_input_devices()
+        except Exception:
+            displays, ptrs, kbds, phys_devs, masters = [], [], [], [], {}
 
         GLib.idle_add(self._populate_all_ui, displays, ptrs, kbds, phys_devs, masters)
 
     def _populate_all_ui(self, displays, ptrs, kbds, phys_devs, masters):
+        if getattr(self, "btn_refresh", None) and hasattr(self.btn_refresh, "set_sensitive"):
+            self.btn_refresh.set_sensitive(True)
+
         # 1. Displays
         self.disp_store.clear()
         for d in displays:
@@ -367,6 +378,30 @@ class DevicesTab(Gtk.Box):
             ])
 
     # ── Actions ───────────────────────────────────────────────────────────
+    def _run_bg_action(self, button, action_fn, on_done_fn=None):
+        if button and hasattr(button, "set_sensitive"):
+            button.set_sensitive(False)
+
+        def worker():
+            try:
+                res = action_fn()
+                err = None
+            except Exception as exc:
+                res = None
+                err = exc
+
+            def done():
+                if button and hasattr(button, "set_sensitive"):
+                    button.set_sensitive(True)
+                if on_done_fn:
+                    on_done_fn(res, err)
+                self.refresh()
+                return False
+
+            GLib.idle_add(done)
+
+        threading.Thread(target=worker, daemon=True).start()
+
     def _get_selected_id(self, tv):
         sel = tv.get_selection()
         model, it = sel.get_selected()
@@ -374,69 +409,112 @@ class DevicesTab(Gtk.Box):
             return None
         return int(model[it][0])
 
-    def _on_attach_ptr_core(self, _btn):
+    def _on_attach_ptr_core(self, btn):
         dev_id = self._get_selected_id(self.ptr_tv)
         if not dev_id:
             self.app.show_info("Select a pointer first.", 1)
             return
-        self.app.seating_engine.reattach_device(dev_id, 2)
-        self.app.seating_engine.manual_hold_until = time.time() + 60
-        self.app.dashboard_tab.append_log(f"Pointer {dev_id} reattached to Virtual core pointer. (Hotplug paused 60s)")
-        self.app.show_info("Attached to Virtual core. Hotplug paused 60s.", 0)
-        self.refresh()
 
-    def _on_attach_ptr_seat(self, seat_id: str):
+        def _action():
+            self.app.seating_engine.reattach_device(dev_id, 2)
+            self.app.seating_engine.manual_hold_until = time.time() + 60
+
+        def _done(_res, err):
+            if err:
+                self.app.show_info(f"Failed to attach pointer: {err}", 1)
+            else:
+                self.app.dashboard_tab.append_log(f"Pointer {dev_id} reattached to Virtual core pointer. (Hotplug paused 60s)")
+                self.app.show_info("Attached to Virtual core. Hotplug paused 60s.", 0)
+
+        self._run_bg_action(btn, _action, _done)
+
+    def _on_attach_ptr_seat(self, btn, seat_id: str):
         dev_id = self._get_selected_id(self.ptr_tv)
         if not dev_id:
             self.app.show_info("Select a pointer first.", 1)
             return
         m_name = self.app.seating_engine.master_name(seat_id)
-        ptr_id = self.app.seating_engine.seat_pointers.get(seat_id)
-        if not ptr_id:
-            ptr_id, _ = self.app.seating_engine.create_master_pair(m_name)
+
+        def _action():
+            ptr_id = self.app.seating_engine.seat_pointers.get(seat_id)
+            if not ptr_id:
+                ptr_id, _ = self.app.seating_engine.create_master_pair(m_name)
+                if ptr_id:
+                    self.app.seating_engine.seat_pointers[seat_id] = ptr_id
             if ptr_id:
-                self.app.seating_engine.seat_pointers[seat_id] = ptr_id
-        if ptr_id:
-            self.app.seating_engine.reattach_device(dev_id, ptr_id)
-            self.app.seating_engine.manual_hold_until = time.time() + 60
-            self.app.dashboard_tab.append_log(f"Pointer {dev_id} reattached to {m_name} pointer ({ptr_id}). (Hotplug paused 60s)")
-            self.app.show_info(f"Attached to {m_name}. Hotplug paused 60s.", 0)
-            self.refresh()
+                self.app.seating_engine.reattach_device(dev_id, ptr_id)
+                self.app.seating_engine.manual_hold_until = time.time() + 60
+                return ptr_id
+            raise RuntimeError(f"Could not create master pair for {seat_id}")
 
-    def _on_attach_kbd_core(self, _btn):
+        def _done(res, err):
+            if err:
+                self.app.show_info(f"Failed to attach pointer to {m_name}: {err}", 1)
+            else:
+                self.app.dashboard_tab.append_log(f"Pointer {dev_id} reattached to {m_name} pointer ({res}). (Hotplug paused 60s)")
+                self.app.show_info(f"Attached to {m_name}. Hotplug paused 60s.", 0)
+
+        self._run_bg_action(btn, _action, _done)
+
+    def _on_attach_kbd_core(self, btn):
         dev_id = self._get_selected_id(self.kbd_tv)
         if not dev_id:
             self.app.show_info("Select a keyboard first.", 1)
             return
-        self.app.seating_engine.reattach_device(dev_id, 3)
-        self.app.seating_engine.manual_hold_until = time.time() + 60
-        self.app.dashboard_tab.append_log(f"Keyboard {dev_id} reattached to Virtual core keyboard. (Hotplug paused 60s)")
-        self.app.show_info("Attached to Virtual core. Hotplug paused 60s.", 0)
-        self.refresh()
 
-    def _on_attach_kbd_seat(self, seat_id: str):
+        def _action():
+            self.app.seating_engine.reattach_device(dev_id, 3)
+            self.app.seating_engine.manual_hold_until = time.time() + 60
+
+        def _done(_res, err):
+            if err:
+                self.app.show_info(f"Failed to attach keyboard: {err}", 1)
+            else:
+                self.app.dashboard_tab.append_log(f"Keyboard {dev_id} reattached to Virtual core keyboard. (Hotplug paused 60s)")
+                self.app.show_info("Attached to Virtual core. Hotplug paused 60s.", 0)
+
+        self._run_bg_action(btn, _action, _done)
+
+    def _on_attach_kbd_seat(self, btn, seat_id: str):
         dev_id = self._get_selected_id(self.kbd_tv)
         if not dev_id:
             self.app.show_info("Select a keyboard first.", 1)
             return
         m_name = self.app.seating_engine.master_name(seat_id)
-        kbd_id = self.app.seating_engine.seat_keyboards.get(seat_id)
-        if not kbd_id:
-            _, kbd_id = self.app.seating_engine.create_master_pair(m_name)
-            if kbd_id:
-                self.app.seating_engine.seat_keyboards[seat_id] = kbd_id
-        if kbd_id:
-            self.app.seating_engine.reattach_device(dev_id, kbd_id)
-            self.app.seating_engine.manual_hold_until = time.time() + 60
-            self.app.dashboard_tab.append_log(f"Keyboard {dev_id} reattached to {m_name} keyboard ({kbd_id}). (Hotplug paused 60s)")
-            self.app.show_info(f"Attached to {m_name}. Hotplug paused 60s.", 0)
-            self.refresh()
 
-    def _on_reset_all(self, _btn):
-        self.app.seating_engine.reset_all_to_core()
-        self.app.show_info("All devices reattached to core masters.", 0)
-        self.app.dashboard_tab.append_log("All devices reset to Virtual core.")
-        self.refresh()
+        def _action():
+            kbd_id = self.app.seating_engine.seat_keyboards.get(seat_id)
+            if not kbd_id:
+                _, kbd_id = self.app.seating_engine.create_master_pair(m_name)
+                if kbd_id:
+                    self.app.seating_engine.seat_keyboards[seat_id] = kbd_id
+            if kbd_id:
+                self.app.seating_engine.reattach_device(dev_id, kbd_id)
+                self.app.seating_engine.manual_hold_until = time.time() + 60
+                return kbd_id
+            raise RuntimeError(f"Could not create master pair for {seat_id}")
+
+        def _done(res, err):
+            if err:
+                self.app.show_info(f"Failed to attach keyboard to {m_name}: {err}", 1)
+            else:
+                self.app.dashboard_tab.append_log(f"Keyboard {dev_id} reattached to {m_name} keyboard ({res}). (Hotplug paused 60s)")
+                self.app.show_info(f"Attached to {m_name}. Hotplug paused 60s.", 0)
+
+        self._run_bg_action(btn, _action, _done)
+
+    def _on_reset_all(self, btn):
+        def _action():
+            self.app.seating_engine.reset_all_to_core()
+
+        def _done(_res, err):
+            if err:
+                self.app.show_info(f"Failed to reset devices: {err}", 1)
+            else:
+                self.app.show_info("All devices reattached to core masters.", 0)
+                self.app.dashboard_tab.append_log("All devices reset to Virtual core.")
+
+        self._run_bg_action(btn, _action, _done)
 
     def _on_interactive_finder(self, _btn):
         dlg = DeviceFinderDialog(self.app)

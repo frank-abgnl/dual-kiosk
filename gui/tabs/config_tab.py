@@ -8,6 +8,7 @@ gi.require_version('Gtk', '3.0')
 from gi.repository import Gtk, GLib
 import json
 import subprocess
+import threading
 from pathlib import Path
 
 
@@ -26,26 +27,26 @@ class ConfigTab(Gtk.Box):
         tb = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
         self.pack_start(tb, False, False, 0)
 
-        btn_save = Gtk.Button(label="💾  Save JSON")
-        btn_save.get_style_context().add_class("btn-primary")
-        btn_save.connect("clicked", self._on_save)
-        tb.pack_start(btn_save, False, False, 0)
+        self.btn_save = Gtk.Button(label="💾  Save JSON")
+        self.btn_save.get_style_context().add_class("btn-primary")
+        self.btn_save.connect("clicked", self._on_save)
+        tb.pack_start(self.btn_save, False, False, 0)
 
-        btn_validate = Gtk.Button(label="✅  Validate Config")
-        btn_validate.connect("clicked", self._on_validate)
-        tb.pack_start(btn_validate, False, False, 0)
+        self.btn_validate = Gtk.Button(label="✅  Validate Config")
+        self.btn_validate.connect("clicked", self._on_validate)
+        tb.pack_start(self.btn_validate, False, False, 0)
 
-        btn_reload = Gtk.Button(label="🔄  Reload File")
-        btn_reload.connect("clicked", lambda _: self.reload_file())
-        tb.pack_start(btn_reload, False, False, 0)
+        self.btn_reload = Gtk.Button(label="🔄  Reload File")
+        self.btn_reload.connect("clicked", lambda b: self.reload_file(b))
+        tb.pack_start(self.btn_reload, False, False, 0)
 
         btn_profiles = Gtk.Button(label="📁  Open Profiles Folder")
         btn_profiles.connect("clicked", self._on_open_profiles_dir)
         tb.pack_start(btn_profiles, False, False, 0)
 
-        btn_default = Gtk.Button(label="⚙  Reset to Defaults")
-        btn_default.connect("clicked", self._on_reset_default)
-        tb.pack_end(btn_default, False, False, 0)
+        self.btn_default = Gtk.Button(label="⚙  Reset to Defaults")
+        self.btn_default.connect("clicked", self._on_reset_default)
+        tb.pack_end(self.btn_default, False, False, 0)
 
         # Path label
         self.path_lbl = Gtk.Label()
@@ -67,16 +68,31 @@ class ConfigTab(Gtk.Box):
 
         self.reload_file()
 
-    def reload_file(self):
-        """Loads JSON content into the editor buffer."""
-        try:
-            cfg = self.app.config_mgr.load_config()
-            text = json.dumps(cfg, indent=2)
-            self.editor_buf.set_text(text)
-        except Exception as exc:
-            self.editor_buf.set_text(f"// Error loading config: {exc}")
+    def reload_file(self, btn=None):
+        """Loads JSON content into the editor buffer asynchronously."""
+        target_btn = btn or getattr(self, "btn_reload", None)
+        if target_btn and hasattr(target_btn, "set_sensitive"):
+            target_btn.set_sensitive(False)
 
-    def _on_save(self, _btn):
+        def _worker():
+            try:
+                cfg = self.app.config_mgr.load_config()
+                text = json.dumps(cfg, indent=2)
+            except Exception as exc:
+                text = f"// Error loading config: {exc}"
+
+            def _done():
+                self.editor_buf.set_text(text)
+                if target_btn and hasattr(target_btn, "set_sensitive"):
+                    target_btn.set_sensitive(True)
+                return False
+
+            GLib.idle_add(_done)
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _on_save(self, btn=None):
+        target_btn = btn or getattr(self, "btn_save", None)
         start = self.editor_buf.get_start_iter()
         end = self.editor_buf.get_end_iter()
         text = self.editor_buf.get_text(start, end, True)
@@ -87,33 +103,71 @@ class ConfigTab(Gtk.Box):
             self.app.show_info(f"Invalid JSON syntax: {err}", 1)
             return
 
-        ok = self.app.config_mgr.save_config(parsed)
-        if ok:
-            self.app.show_info("Configuration JSON saved successfully ✓", 0)
-            self.app.dashboard_tab.append_log("Raw config JSON updated and saved.")
-            self.app.seats_tab.refresh()
-            self.app.dashboard_tab.refresh_metrics()
-        else:
-            self.app.show_info("Failed to write config file!", 1)
+        if target_btn and hasattr(target_btn, "set_sensitive"):
+            target_btn.set_sensitive(False)
 
-    def _on_validate(self, _btn):
+        def _worker():
+            try:
+                ok = self.app.config_mgr.save_config(parsed)
+                err = None
+            except Exception as exc:
+                ok = False
+                err = exc
+
+            def _done():
+                if target_btn and hasattr(target_btn, "set_sensitive"):
+                    target_btn.set_sensitive(True)
+                if ok:
+                    self.app.show_info("Configuration JSON saved successfully ✓", 0)
+                    self.app.dashboard_tab.append_log("Raw config JSON updated and saved.")
+                    self.app.seats_tab.refresh()
+                    self.app.dashboard_tab.refresh_metrics()
+                else:
+                    self.app.show_info(f"Failed to write config file! {err if err else ''}", 1)
+                return False
+
+            GLib.idle_add(_done)
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _on_validate(self, btn=None):
+        target_btn = btn or getattr(self, "btn_validate", None)
         start = self.editor_buf.get_start_iter()
         end = self.editor_buf.get_end_iter()
         text = self.editor_buf.get_text(start, end, True)
 
-        try:
-            parsed = json.loads(text)
-        except json.JSONDecodeError as err:
-            self.app.show_info(f"JSON Parse Error: {err}", 1)
-            return
+        if target_btn and hasattr(target_btn, "set_sensitive"):
+            target_btn.set_sensitive(False)
 
-        from core.schema import validate
-        issues = validate(parsed)
-        if issues:
-            msg = "Validation issues:\n• " + "\n• ".join(f"[{e.path}] {e.message}" for e in issues)
-            self.app.show_info(msg, 1)
-        else:
-            self.app.show_info("Config validation passed successfully ✓", 0)
+        def _worker():
+            try:
+                parsed = json.loads(text)
+                parse_err = None
+            except json.JSONDecodeError as err:
+                parsed = None
+                parse_err = err
+
+            if parse_err:
+                issues = None
+            else:
+                from core.schema import validate
+                issues = validate(parsed)
+
+            def _done():
+                if target_btn and hasattr(target_btn, "set_sensitive"):
+                    target_btn.set_sensitive(True)
+                if parse_err:
+                    self.app.show_info(f"JSON Parse Error: {parse_err}", 1)
+                elif issues:
+                    msg = "Validation issues:\n• " + "\n• ".join(f"[{e.path}] {e.message}" for e in issues)
+                    self.app.show_info(msg, 1)
+                else:
+                    self.app.show_info("Config validation passed successfully ✓", 0)
+                return False
+
+            GLib.idle_add(_done)
+
+        threading.Thread(target=_worker, daemon=True).start()
 
     def _on_open_profiles_dir(self, _btn):
         p_dir = str(self.app.kiosk_mgr.get_profile_path(""))
@@ -122,7 +176,8 @@ class ConfigTab(Gtk.Box):
         except Exception as exc:
             self.app.show_info(f"Could not open file manager: {exc}", 1)
 
-    def _on_reset_default(self, _btn):
+    def _on_reset_default(self, btn=None):
+        target_btn = btn or getattr(self, "btn_default", None)
         dlg = Gtk.MessageDialog(
             transient_for=self.app,
             modal=True,
@@ -134,7 +189,27 @@ class ConfigTab(Gtk.Box):
         resp = dlg.run()
         dlg.destroy()
         if resp == Gtk.ResponseType.YES:
-            self.app.config_mgr.reset_to_defaults()
-            self.reload_file()
-            self.app.seats_tab.refresh()
-            self.app.show_info("Configuration reset to defaults (backup saved to config.json.bak).", 0)
+            if target_btn and hasattr(target_btn, "set_sensitive"):
+                target_btn.set_sensitive(False)
+
+            def _worker():
+                try:
+                    self.app.config_mgr.reset_to_defaults()
+                    err = None
+                except Exception as exc:
+                    err = exc
+
+                def _done():
+                    if target_btn and hasattr(target_btn, "set_sensitive"):
+                        target_btn.set_sensitive(True)
+                    if err:
+                        self.app.show_info(f"Failed to reset: {err}", 1)
+                    else:
+                        self.reload_file()
+                        self.app.seats_tab.refresh()
+                        self.app.show_info("Configuration reset to defaults (backup saved to config.json.bak).", 0)
+                    return False
+
+                GLib.idle_add(_done)
+
+            threading.Thread(target=_worker, daemon=True).start()
