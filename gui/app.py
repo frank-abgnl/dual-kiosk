@@ -27,8 +27,8 @@ logger = logging.getLogger("xinput_seating.app")
 class XInputMultiseatApp(Gtk.ApplicationWindow):
     """Main window for XInput Pseudo-Seating Control Panel with overlay mode support."""
 
-    def __init__(self, overlay_mode: bool = False, target_seat: str = "seat1"):
-        super().__init__(title="XInput Pseudo-Seating Control Panel")
+    def __init__(self, overlay_mode: bool = False, target_seat: str = "seat1", application=None):
+        super().__init__(title="XInput Pseudo-Seating Control Panel", application=application)
         self.set_default_size(960, 680)
         self.set_position(Gtk.WindowPosition.CENTER)
 
@@ -585,7 +585,7 @@ class XInputMultiseatApp(Gtk.ApplicationWindow):
     # Clean Shutdown
     # -----------------------------------------------------------------------
     def _on_window_destroy(self, _widget):
-        logger.info("Window closing. Binding GUI exit with full kiosk & desktop session teardown...")
+        logger.info("Window closing...")
         overlay_state.clear()  # never leave a seat whitelisted after the GUI exits
         if hasattr(self, 'hotkey_mgr') and self.hotkey_mgr:
             self.hotkey_mgr.stop()
@@ -593,6 +593,10 @@ class XInputMultiseatApp(Gtk.ApplicationWindow):
             self.ipc_server.stop()
         if not self._shutting_down:
             self._shutting_down = True
-            session_mgr.stop_session(exit_gui=False)
+            if get_supervisor_pid():
+                logger.info("Supervisor is running in background; closing GUI without stopping kiosks.")
+            else:
+                logger.info("No background supervisor; stopping kiosks and resetting input on GUI close.")
+                session_mgr.stop_session(exit_gui=False)
         if Gtk.main_level() > 0:
             Gtk.main_quit()

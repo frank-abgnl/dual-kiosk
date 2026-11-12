@@ -10,6 +10,10 @@ import sys
 import os
 import argparse
 import logging
+import signal
+
+# Enforce X11 backend for GDK on Wayland desktops
+os.environ.setdefault("GDK_BACKEND", "x11")
 
 # Ensure project root is in sys.path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))

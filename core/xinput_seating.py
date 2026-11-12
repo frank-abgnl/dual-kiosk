@@ -409,7 +409,7 @@ class XInputSeatingEngine:
 
         masters = self.get_existing_masters()
         for name, data in masters.items():
-            if name != "Virtual core":
+            if name.startswith("Seat_"):
                 self.remove_master_pair(name)
 
         logger.info("XInput reset complete.")

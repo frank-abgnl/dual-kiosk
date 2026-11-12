@@ -19,6 +19,7 @@ LOCK_FILE = STATE_DIR / "launcher.lock"
 PID_FILE = STATE_DIR / "launcher.pid"
 LOG_FILE = STATE_DIR / "launcher.log"
 SOCKET_PATH = STATE_DIR / "overlay.sock"
+SPAWN_GUARD_FILE = STATE_DIR / "spawn_guard"
 KEYMAP_DIR = STATE_DIR / "keymaps"
 PROFILES_DIR = CONFIG_DIR / "profiles"
 

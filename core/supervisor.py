@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Optional
 
 from core.hotkey_manager import HotkeyManager, send_overlay_command
-from core.paths import LOCK_FILE, LOG_FILE, PID_FILE, STATE_DIR, ensure_state_dir
+from core.paths import LOCK_FILE, LOG_FILE, PID_FILE, STATE_DIR, SPAWN_GUARD_FILE, ensure_state_dir
 from core.session_manager import session_mgr, StartResult
 
 logger = logging.getLogger("xinput_seating.supervisor")
@@ -87,6 +87,22 @@ def cmd_control_board(seat: str) -> int:
     return 0
 
 
+def check_spawn_guard(cooldown: float = 10.0, sleep_fn=time.sleep):
+    """Prevents rapid respawn loops if supervisor is crashing repeatedly."""
+    now = time.time()
+    try:
+        if SPAWN_GUARD_FILE.exists():
+            last = float(SPAWN_GUARD_FILE.read_text().strip())
+            elapsed = now - last
+            if elapsed < cooldown:
+                wait_time = cooldown - elapsed
+                logger.warning(f"Spawn guard active: restarted within {elapsed:.1f}s. Pausing {wait_time:.1f}s...")
+                sleep_fn(wait_time)
+        SPAWN_GUARD_FILE.write_text(str(time.time()))
+    except Exception as exc:
+        logger.debug(f"Spawn guard notice: {exc}")
+
+
 def run(
     args=None,
     lock_path: Optional[Path] = None,
@@ -122,6 +138,8 @@ def run(
         if getattr(args, "seat", None):
             cmd_control_board(args.seat)
         return 0
+
+    check_spawn_guard(10.0, sleep_fn=sleep_fn)
 
     stop = stop_event or threading.Event()
     if threading.current_thread() is threading.main_thread():
