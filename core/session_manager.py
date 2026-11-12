@@ -364,19 +364,27 @@ class SessionManager:
 
         # 3. Apply XInput pseudo-seating (MPX masters + confinement)
         _emit("Applying XInput MPX master pairs and device reattachments...")
-        results = self.engine.apply_seating(seats, displays, (total["width"], total["height"]))
+        settings = cfg.get("settings", {})
+        confine = settings.get("confine_mouse_to_screen", True)
+        results = self.engine.apply_seating(
+            seats, displays, (total["width"], total["height"]),
+            confine_mouse_to_screen=confine,
+        )
         _emit(f"Seating applied: {results}")
 
         # 4. Launch dual Firefox kiosks
         _emit("Launching dual Firefox kiosks with isolated profiles...")
         s1_url = seats[0].get("kiosk_url") if len(seats) > 0 else "https://duckduckgo.com"
         s2_url = seats[1].get("kiosk_url") if len(seats) > 1 else "https://www.google.com"
+        watchdog_interval = float(settings.get("watchdog_interval_sec", 1.5))
 
         ok = self.kiosk.launch_dual_kiosks(
             seat1_url=s1_url or "https://duckduckgo.com",
             seat2_url=s2_url or "https://www.google.com",
             displays_info=displays,
             enforce_lock=True,
+            seat_configs=seats,
+            watchdog_interval_sec=watchdog_interval,
         )
 
         if ok:

@@ -221,9 +221,12 @@ def run(
                 gui_proc = None
             if time.time() - last_hotplug >= 1.5:
                 last_hotplug = time.time()
-                seats = session_mgr.cfg_mgr.load_config().get("seats", [])
-                for msg in session_mgr.engine.check_and_reseat_hotplugged_devices(seats):
-                    notify(msg)
+                cfg = session_mgr.cfg_mgr.load_config()
+                seats = cfg.get("seats", [])
+                settings = cfg.get("settings", {})
+                if settings.get("hotplug_auto_reseat", True):
+                    for msg in session_mgr.engine.check_and_reseat_hotplugged_devices(seats):
+                        notify(msg)
         return 0
     except Exception as exc:
         logger.exception(f"Supervisor failed: {exc}")

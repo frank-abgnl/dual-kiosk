@@ -438,6 +438,7 @@ class XInputSeatingEngine:
         seats_config: List[Dict],
         displays_info: Optional[List[Dict]] = None,
         total_screen: Optional[Tuple[int, int]] = None,
+        confine_mouse_to_screen: bool = True,
     ) -> Dict[str, bool]:
         """
         Applies a multi-seat configuration:
@@ -508,14 +509,18 @@ class XInputSeatingEngine:
                     self.copy_keyboard_layout(master_kbd)
 
             # Confine the *master* pointer to this seat's monitor.
-            if isinstance(master_ptr, int) and display_name in disp_map:
-                d = disp_map[display_name]
-                if d.get("width") and d.get("height"):
-                    geom = (d["width"], d["height"], d["x"], d["y"])
-                    results[f"{seat_id}_confined"] = self.confine_master(master_ptr, geom, total_screen)
+            if confine_mouse_to_screen:
+                if isinstance(master_ptr, int) and display_name in disp_map:
+                    d = disp_map[display_name]
+                    if d.get("width") and d.get("height"):
+                        geom = (d["width"], d["height"], d["x"], d["y"])
+                        results[f"{seat_id}_confined"] = self.confine_master(master_ptr, geom, total_screen)
+                else:
+                    logger.warning(f"Seat '{seat_id}': display {display_name!r} not found or master unknown; not confined.")
+                    results[f"{seat_id}_confined"] = False
             else:
-                logger.warning(f"Seat '{seat_id}': display {display_name!r} not found or master unknown; not confined.")
-                results[f"{seat_id}_confined"] = False
+                logger.info(f"Seat '{seat_id}': pointer confinement disabled by config.")
+                results[f"{seat_id}_confined"] = True
 
         return results
 

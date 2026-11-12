@@ -36,6 +36,29 @@ def run_command(args, timeout=5):
         return "", str(exc), -1
 
 
+SYSTEM_POLICY_PATHS = [
+    Path("/etc/firefox/policies/policies.json"),
+    Path("/usr/lib/firefox/distribution/policies.json"),
+    Path("/usr/lib64/firefox/distribution/policies.json"),
+    Path("/etc/firefox/policies.json"),
+]
+
+
+def check_system_policies_installed() -> bool:
+    """Checks if system-wide Firefox enterprise policies are in place."""
+    return any(p.exists() for p in SYSTEM_POLICY_PATHS)
+
+
+def validate_kiosk_url(url: str) -> str:
+    """Validates that URL begins with http://, https://, or about:."""
+    if not url or not isinstance(url, str):
+        raise ValueError("Kiosk URL must be a non-empty string.")
+    clean = url.strip()
+    if not (clean.startswith("http://") or clean.startswith("https://") or clean.startswith("about:")):
+        raise ValueError(f"Invalid kiosk URL '{url}': must start with http://, https://, or about:")
+    return clean
+
+
 class KioskManager:
     """Manages multi-screen Firefox kiosk sessions and enforces window restrictions."""
 
@@ -61,22 +84,30 @@ class KioskManager:
     # -----------------------------------------------------------------------
     # Profile Setup & Lockdown
     # -----------------------------------------------------------------------
-    def get_profile_path(self, seat_id: str) -> Path:
+    def get_profile_path(self, seat_id: str, profile_name: Optional[str] = None) -> Path:
         """Returns the profile directory path for a given seat."""
-        p = PROFILES_DIR / seat_id
+        name = profile_name or seat_id
+        p = PROFILES_DIR / name
         p.mkdir(parents=True, exist_ok=True)
         return p
 
-    def setup_profile(self, seat_id: str, kiosk_url: str = "https://duckduckgo.com") -> Path:
+    def setup_profile(
+        self,
+        seat_id: str,
+        kiosk_url: str = "https://duckduckgo.com",
+        profile_name: Optional[str] = None,
+    ) -> Path:
         """
         Creates or updates a locked-down Firefox profile for the seat.
         Configures user.js and distribution policies to restrict navigation and close actions.
         """
-        profile_path = self.get_profile_path(seat_id)
+        valid_url = validate_kiosk_url(kiosk_url)
+        profile_path = self.get_profile_path(seat_id, profile_name=profile_name)
 
         user_js = profile_path / "user.js"
+        escaped_url = json.dumps(valid_url)
         prefs = f"""// Auto-generated kiosk preferences for seat: {seat_id}
-user_pref("browser.startup.homepage", "{kiosk_url}");
+user_pref("browser.startup.homepage", {escaped_url});
 user_pref("browser.startup.page", 1);
 user_pref("browser.tabs.closeWindowWithLastTab", false);
 user_pref("browser.warnOnQuit", false);
@@ -93,6 +124,9 @@ user_pref("extensions.pocket.enabled", false);
 user_pref("datareporting.policy.dataSubmissionEnabled", false);
 user_pref("privacy.sanitize.sanitizeOnShutdown", false);
 user_pref("browser.shell.checkDefaultBrowser", false);
+user_pref("devtools.policy.disabled", true);
+user_pref("browser.tabs.warnOnClose", false);
+user_pref("security.fileuri.strict_origin_policy", true);
 user_pref("app.update.auto", false);
 user_pref("app.update.enabled", false);
 """
@@ -108,11 +142,15 @@ user_pref("app.update.enabled", false);
             "policies": {
                 "DisableAppUpdate": True,
                 "DisableDeveloperTools": True,
+                "BlockAboutConfig": True,
                 "PromptForDownloadLocation": False,
-                "OverrideFirstRunPage": kiosk_url,
-                "OverridePostUpdatePage": kiosk_url,
+                "OverrideFirstRunPage": valid_url,
+                "OverridePostUpdatePage": valid_url,
                 "SanitizeOnShutdown": False,
                 "DontCheckDefaultBrowser": True,
+                "DisableFirefoxStudies": True,
+                "DisableTelemetry": True,
+                "NoDefaultBookmarks": True,
             }
         }
         try:
@@ -132,6 +170,8 @@ user_pref("app.update.enabled", false);
         monitor_index: int = 0,
         display_geometry: Optional[Tuple[int, int, int, int]] = None,
         enforce_lock: bool = True,
+        auto_respawn: bool = True,
+        profile_name: Optional[str] = None,
     ) -> bool:
         """
         Launches a single Firefox instance in kiosk mode with its dedicated profile.
@@ -143,7 +183,7 @@ user_pref("app.update.enabled", false);
             if seat_id in self.running_processes:
                 self._terminate_seat_process(seat_id)
 
-            profile_path = self.setup_profile(seat_id, kiosk_url)
+            profile_path = self.setup_profile(seat_id, kiosk_url, profile_name=profile_name)
 
             cmd = [
                 "firefox",
@@ -171,6 +211,8 @@ user_pref("app.update.enabled", false);
                     "monitor_index": monitor_index,
                     "display_geometry": display_geometry,
                     "enforce_lock": enforce_lock,
+                    "auto_respawn": auto_respawn,
+                    "profile_name": profile_name or seat_id,
                 }
             except Exception as exc:
                 logger.error(f"Failed to spawn Firefox for seat '{seat_id}': {exc}")
@@ -370,14 +412,16 @@ user_pref("app.update.enabled", false);
                     continue
 
                 if proc is None or proc.poll() is not None:
-                    if cfg.get("enforce_lock", True):
+                    if cfg.get("auto_respawn", True):
                         logger.warning(f"[Watchdog] Kiosk process for seat '{seat_id}' terminated! Auto-respawning...")
                         self.launch_kiosk(
                             seat_id=seat_id,
                             kiosk_url=cfg.get("kiosk_url", "https://duckduckgo.com"),
                             monitor_index=cfg.get("monitor_index", 0),
                             display_geometry=cfg.get("display_geometry"),
-                            enforce_lock=True,
+                            enforce_lock=cfg.get("enforce_lock", True),
+                            auto_respawn=True,
+                            profile_name=cfg.get("profile_name", seat_id),
                         )
                     continue
 
@@ -427,16 +471,42 @@ user_pref("app.update.enabled", false);
         seat2_url: str = "https://www.google.com",
         displays_info: Optional[List[Dict]] = None,
         enforce_lock: bool = True,
+        seat_configs: Optional[List[Dict]] = None,
+        watchdog_interval_sec: float = 1.5,
     ) -> bool:
         """Launches Seat 1 and Seat 2 kiosks, each on the monitor configured for that seat."""
+        if not check_system_policies_installed():
+            logger.warning(
+                "Firefox system enterprise policies not detected in /etc/firefox/policies/policies.json. "
+                "Run 'sudo ./install-policies.sh' to lock down about:config, developer tools, and updates."
+            )
+
         geom1, geom2 = self._geometry_for_seats(displays_info)
+        s1_cfg = (seat_configs[0] if seat_configs and len(seat_configs) > 0 else {}) or {}
+        s2_cfg = (seat_configs[1] if seat_configs and len(seat_configs) > 1 else {}) or {}
 
-        ok1 = self.launch_kiosk("seat1", seat1_url, monitor_index=0, display_geometry=geom1, enforce_lock=enforce_lock)
+        s1_url = s1_cfg.get("kiosk_url") or seat1_url
+        s2_url = s2_cfg.get("kiosk_url") or seat2_url
+        s1_lock = s1_cfg.get("lock_kiosk", enforce_lock)
+        s2_lock = s2_cfg.get("lock_kiosk", enforce_lock)
+        s1_respawn = s1_cfg.get("auto_respawn", True)
+        s2_respawn = s2_cfg.get("auto_respawn", True)
+        s1_prof = s1_cfg.get("profile_name", "seat1")
+        s2_prof = s2_cfg.get("profile_name", "seat2")
+
+        ok1 = self.launch_kiosk(
+            "seat1", s1_url, monitor_index=0, display_geometry=geom1,
+            enforce_lock=s1_lock, auto_respawn=s1_respawn, profile_name=s1_prof,
+        )
         time.sleep(1.5)  # stagger so window discovery doesn't race between the two instances
-        ok2 = self.launch_kiosk("seat2", seat2_url, monitor_index=1, display_geometry=geom2, enforce_lock=enforce_lock)
+        ok2 = self.launch_kiosk(
+            "seat2", s2_url, monitor_index=1, display_geometry=geom2,
+            enforce_lock=s2_lock, auto_respawn=s2_respawn, profile_name=s2_prof,
+        )
 
-        if enforce_lock:
-            self.start_watchdog()
+        if s1_lock or s2_lock or s1_respawn or s2_respawn:
+            self.start_watchdog(interval_sec=watchdog_interval_sec)
+        if s1_lock or s2_lock:
             self.start_shield()
 
         return ok1 and ok2

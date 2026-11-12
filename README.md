@@ -85,7 +85,7 @@ flowchart TD
   - One-click restore: returns all devices to core and cleans up custom masters.
 - **Robust Firefox Kiosk Management:**
   - Dedicated profile isolation (`~/.config/xinput-seats/profiles/seat1` and `seat2`).
-  - Custom `user.js` and enterprise `policies.json` disabling window close shortcuts (`Ctrl+W`, `Ctrl+Q`), developer tools, updates, and crash prompts.
+  - Custom `user.js` and enterprise `policies.json` disabling developer tools, about:config, crash prompts, and update nag screens. (Note: standard Firefox does not allow page-level interception of `Ctrl+W`/`Ctrl+Q`; the supervisor watchdog immediately auto-respawns any closed browser).
   - **Non-Minimizable & Non-Closable Enforcement:** Strips `_NET_WM_ACTION_CLOSE` and `_NET_WM_ACTION_MINIMIZE` from `_NET_WM_ALLOWED_ACTIONS`.
   - **Supervisor Watchdog:** Runs a background monitoring daemon that auto-respawns Firefox if terminated and automatically un-minimizes if hidden.
 - **GTK3 Control Panel UI:**
