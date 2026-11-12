@@ -50,6 +50,7 @@ class KioskManager:
         # Optional hook: callback(seat_id, window_id). Used to give the seat's
         # keyboard master focus on its kiosk window.
         self.on_window_ready = None
+        self._last_bound: Dict[str, str] = {}
         self.overlay_seat: Optional[str] = None
         self._demoted_fs: Dict[str, bool] = {}  # seat -> True if we removed fullscreen for the overlay
         self.shield = None   # KioskShield (Super-key block + window policing)
@@ -263,9 +264,23 @@ user_pref("app.update.enabled", false);
         """True while the Control Board is whitelisted on this seat (any process)."""
         return self.overlay_seat == seat_id or overlay_state.is_active(seat_id)
 
-    def _notify_window(self, seat_id: str, win_id: str):
+    def invalidate_focus_bindings(self, seat_id: Optional[str] = None):
+        """Invalidates cached focus bindings so _notify_window will re-bind on the next tick."""
+        with self._lock:
+            if seat_id:
+                self._last_bound.pop(seat_id, None)
+            else:
+                self._last_bound.clear()
+
+    def _notify_window(self, seat_id: str, win_id: str, force: bool = False):
         if self._overlay_blocks(seat_id):
             return  # never pin focus back to the kiosk while the overlay owns the seat
+
+        with self._lock:
+            if not force and self._last_bound.get(seat_id) == win_id:
+                return
+            self._last_bound[seat_id] = win_id
+
         cb = self.on_window_ready
         if cb:
             try:
@@ -484,6 +499,7 @@ user_pref("app.update.enabled", false);
         except Exception as exc:
             logger.debug(f"External kiosk cleanup notice: {exc}")
 
+        self.invalidate_focus_bindings()
         logger.info("All kiosk instances stopped.")
 
     # -----------------------------------------------------------------------
@@ -495,7 +511,10 @@ user_pref("app.update.enabled", false);
         self.overlay_seat = seat_id
         if prev and prev != seat_id:
             overlay_state.clear(prev)
-        if seat_id:
+            self.invalidate_focus_bindings(prev)
+        if seat_id is None:
+            self.invalidate_focus_bindings()
+        elif seat_id:
             overlay_state.mark_active(seat_id)
         logger.info(f"Kiosk watchdog overlay whitelist set to: {seat_id}")
 
@@ -538,6 +557,7 @@ user_pref("app.update.enabled", false);
 
     def restore_kiosk(self, seat_id: str):
         """Undoes demote/unfullscreen: kiosk returns to fullscreen + above."""
+        self.invalidate_focus_bindings(seat_id)
         win_id = self._kiosk_window(seat_id)
         if not win_id:
             return
