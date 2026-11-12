@@ -173,7 +173,11 @@ def run(
                 break
             if res.code in (StartResult.NEED_DISPLAYS, StartResult.NEED_DEVICES, StartResult.KIOSK_FAILED):
                 notify(f"Startup attempt failed ({res.code}: {res.message}), retrying in {delay}s...")
-                sleep_fn(delay)
+                if sleep_fn is not time.sleep:
+                    sleep_fn(delay)
+                else:
+                    if stop.wait(delay):
+                        break
                 delay = min(delay * 2, 60)
             else:
                 notify(f"Unrecoverable startup error ({res.code}): {res.message}", urgent=True)

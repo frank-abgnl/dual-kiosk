@@ -262,7 +262,8 @@ class DisplayGuard:
             for a in acts:
                 self._emit(f"🖥 Display settings -> extended mode: {a}")
             if acts:
-                time.sleep(2.0)
+                if self._stop.wait(2.0):
+                    return
                 self._relayout(seats)
             return
 

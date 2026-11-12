@@ -470,7 +470,8 @@ user_pref("app.update.enabled", false);
     def _watchdog_loop(self, interval_sec: float):
         """Respawns killed instances / unminimizes hidden ones, except on whitelisted (overlay) seats."""
         while not self._stop_watchdog.is_set():
-            time.sleep(interval_sec)
+            if self._stop_watchdog.wait(interval_sec):
+                break
 
             self.check_idle_resets()
 
