@@ -7,8 +7,10 @@ Discovers displays (via xrandr/DRM) and input devices (via xinput and sysfs).
 import subprocess
 import re
 import glob
+import json
 import logging
 from pathlib import Path
+import time
 from typing import Dict, List, Optional, Tuple, Set
 
 logger = logging.getLogger("xinput_seating.device_manager")
@@ -38,6 +40,20 @@ def run_command(args, timeout=5, check=False):
 
 class DeviceManager:
     """Manages discovery and identification of displays and input devices."""
+
+    _displays_cache: Optional[Tuple[List[Dict], Dict]] = None
+    _displays_cache_ts: float = 0.0
+    _hierarchy_cache: Optional[Tuple[Dict, List[Dict], List[Dict]]] = None
+    _hierarchy_cache_ts: float = 0.0
+    CACHE_TTL: float = 2.0
+
+    @classmethod
+    def clear_cache(cls):
+        """Invalidates all cached display and xinput queries."""
+        cls._displays_cache = None
+        cls._displays_cache_ts = 0.0
+        cls._hierarchy_cache = None
+        cls._hierarchy_cache_ts = 0.0
 
     def __init__(self):
         pass
@@ -120,7 +136,7 @@ class DeviceManager:
 
         return updated_seats, messages
 
-    def get_displays(self):
+    def get_displays(self, force: bool = False):
         """
         Discovers connected video displays using xrandr, falling back to sysfs DRM.
         Returns a list of dicts:
@@ -135,7 +151,12 @@ class DeviceManager:
             'geometry': '1920x1080+0+0',
             'refresh': 60.0
         }, ...]
+        Uses 2-second TTL cache unless force=True.
         """
+        now = time.time()
+        if not force and self._displays_cache is not None and (now - self._displays_cache_ts < self.CACHE_TTL):
+            return json.loads(json.dumps(self._displays_cache[0])), dict(self._displays_cache[1])
+
         displays = []
         out, err, rc = run_command(["xrandr", "--query"])
         total_screen = {"width": 1920, "height": 1080}
@@ -210,7 +231,9 @@ class DeviceManager:
 
         # Sort displays: primary first, then left-to-right by X coordinate
         displays.sort(key=lambda d: (not d.get("primary", False), d.get("x", 0)))
-        return displays, total_screen
+        DeviceManager._displays_cache = (displays, total_screen)
+        DeviceManager._displays_cache_ts = now
+        return json.loads(json.dumps(displays)), dict(total_screen)
 
     # -----------------------------------------------------------------------
     # XInput Device Discovery
@@ -233,14 +256,23 @@ class DeviceManager:
         self._floating_class_cache[dev_id] = cls
         return cls
 
-    def get_xinput_hierarchy(self):
+    def get_xinput_hierarchy(self, force: bool = False):
         """
         Parses `xinput list` into a structured hierarchy of masters and slaves.
         Returns:
             masters: {id: {'id': int, 'name': str, 'type': 'pointer'|'keyboard', 'paired_id': int, 'slaves': [...]}}
             slaves_pointers: [dict, ...]
             slaves_keyboards: [dict, ...]
+        Uses 2-second TTL cache unless force=True.
         """
+        now = time.time()
+        if not force and self._hierarchy_cache is not None and (now - self._hierarchy_cache_ts < self.CACHE_TTL):
+            return (
+                json.loads(json.dumps(self._hierarchy_cache[0])),
+                json.loads(json.dumps(self._hierarchy_cache[1])),
+                json.loads(json.dumps(self._hierarchy_cache[2])),
+            )
+
         out, err, rc = run_command(["xinput", "list"])
         if rc != 0 or not out:
             logger.warning(f"Could not read xinput list: {err}")
@@ -308,7 +340,13 @@ class DeviceManager:
             if att in masters:
                 masters[att]["slaves"].append(slave)
 
-        return masters, slaves_pointers, slaves_keyboards
+        DeviceManager._hierarchy_cache = (masters, slaves_pointers, slaves_keyboards)
+        DeviceManager._hierarchy_cache_ts = now
+        return (
+            json.loads(json.dumps(masters)),
+            json.loads(json.dumps(slaves_pointers)),
+            json.loads(json.dumps(slaves_keyboards)),
+        )
 
     def get_usable_pointers(self):
         """Returns non-XTEST slave pointers suitable for user assignment."""
