@@ -6,7 +6,10 @@ Provides configuration cards for Seat 1 and Seat 2 (monitors, mice, keyboards, F
 import gi
 gi.require_version('Gtk', '3.0')
 from gi.repository import Gtk, GLib
+import logging
 import threading
+
+logger = logging.getLogger("xinput_seating.gui.seats")
 
 
 class SeatCard(Gtk.Frame):
@@ -375,7 +378,7 @@ class SeatsTab(Gtk.Box):
 
     def _on_auto_detect(self, _btn):
         self.app.show_info("Auto-detecting hardware layout and mapping seats...", 0)
-        cfg = self.app.config_mgr.auto_generate_config(self.app.device_mgr)
+        self.app.config_mgr.auto_generate_config(self.app.device_mgr)
         self.app.dashboard_tab.append_log("Auto-detection applied to Seat 1 and Seat 2.")
         self.refresh()
         self.app.show_info("Hardware auto-assigned to Seat 1 and Seat 2 ✓", 0)

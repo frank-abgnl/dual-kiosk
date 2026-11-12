@@ -17,7 +17,7 @@ import logging
 import threading
 import subprocess
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Set, Tuple
+from typing import Callable, Dict, List, Optional, Set, Tuple, Union
 
 logger = logging.getLogger("xinput_seating.hotkey")
 

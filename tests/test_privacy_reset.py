@@ -19,7 +19,7 @@ def test_should_reset_invalid_ts():
 def test_should_reset_threshold():
     last_input = 1000.0
     minutes = 5
-    threshold = 5 * 60  # 300 seconds
+    # threshold = 5 * 60 = 300 seconds
 
     # Not yet reached
     assert should_reset(last_input, last_input + 299.0, minutes) is False

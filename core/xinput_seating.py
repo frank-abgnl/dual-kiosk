@@ -11,7 +11,7 @@ import re
 import logging
 import threading
 import time
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 from core.pointer_barriers import PointerConfiner
 from core.peripheral_resolver import KEYS, PROMOTE_AFTER_SEC, PeripheralMemory, PeripheralResolver

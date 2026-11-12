@@ -143,7 +143,7 @@ class DashboardTab(Gtk.Box):
             autostart_on = is_autostart_enabled()
 
             GLib.idle_add(self._update_ui_cards, num_seats, num_masters, num_displays, running_kiosks, autostart_on)
-        except Exception as exc:
+        except Exception:
             pass
 
     def _update_ui_cards(self, seats, masters, displays, kiosks, autostart_on=False):

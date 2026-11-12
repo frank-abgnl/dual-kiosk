@@ -11,7 +11,7 @@ import os
 from pathlib import Path
 import shutil
 import time
-from typing import Callable, Dict, List, Optional
+from typing import Callable, Dict, List, Optional, Tuple
 
 logger = logging.getLogger("xinput_seating.config")
 
