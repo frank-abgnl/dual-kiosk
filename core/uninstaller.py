@@ -149,17 +149,6 @@ class Uninstaller:
             self._say("    Would reattach all devices to Virtual core and remove custom masters.")
             return
         XInputSeatingEngine().reset_all_to_core()
-
-        # Pick up any devices left floating after master removal.
-        out, rc = _run(["xinput", "list"])
-        if rc == 0:
-            for line in out.splitlines():
-                if "[floating slave]" not in line or "XTEST" in line:
-                    continue
-                dev_id = line.split("id=")[1].split()[0]
-                # Class is unknown from the listing; wrong-class attempt fails harmlessly.
-                for master in (XInputSeatingEngine.CORE_POINTER_ID, XInputSeatingEngine.CORE_KEYBOARD_ID):
-                    _run(["xinput", "reattach", dev_id, str(master)])
         self._say("    XInput devices restored to Virtual core.")
 
     # ------------------------------------------------------------------

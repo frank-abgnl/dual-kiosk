@@ -215,6 +215,24 @@ class DeviceManager:
     # -----------------------------------------------------------------------
     # XInput Device Discovery
     # -----------------------------------------------------------------------
+    _floating_class_cache: Dict[int, str] = {}
+
+    def _classify_floating(self, dev_id: int, name: str = "") -> str:
+        if dev_id in self._floating_class_cache:
+            return self._floating_class_cache[dev_id]
+        out, _, _ = run_command(["xinput", "list", str(dev_id)])
+        out_lower = out.lower()
+        if "reporting" in out_lower or "keys" in out_lower or "key" in out_lower:
+            cls = "keyboard"
+        elif "button" in out_lower:
+            cls = "pointer"
+        elif "keyboard" in name.lower() or "kbd" in name.lower():
+            cls = "keyboard"
+        else:
+            cls = "pointer"
+        self._floating_class_cache[dev_id] = cls
+        return cls
+
     def get_xinput_hierarchy(self):
         """
         Parses `xinput list` into a structured hierarchy of masters and slaves.
@@ -229,7 +247,7 @@ class DeviceManager:
             return {}, [], []
 
         pattern = re.compile(
-            r"^[⎡⎜⎣\s]*([^\t]+?)\s+id=(\d+)\s+\[(master|slave|floating slave)\s*(pointer|keyboard)?\s*(?:\((\d+)\))?\]"
+            r"^[⎡⎜⎣\s~∼]*([^\t]+?)\s+id=(\d+)\s+\[(master|slave|floating slave)\s*(pointer|keyboard)?\s*(?:\((\d+)\))?\]"
         )
 
         masters = {}
@@ -256,6 +274,7 @@ class DeviceManager:
                 "class": dev_class,
                 "attachment": attachment,
                 "is_xtest": is_xtest,
+                "floating": False,
             }
 
             if node_type == "master":
@@ -265,11 +284,22 @@ class DeviceManager:
                     "class": dev_class,
                     "paired_id": attachment,
                     "slaves": [],
+                    "floating": False,
                 }
             elif node_type == "slave":
+                dev_info["floating"] = False
                 if dev_class == "pointer":
                     slaves_pointers.append(dev_info)
                 elif dev_class == "keyboard":
+                    slaves_keyboards.append(dev_info)
+            elif node_type == "floating slave":
+                dev_info["floating"] = True
+                dev_info["attachment"] = None
+                cls = dev_class or self._classify_floating(dev_id, name)
+                dev_info["class"] = cls
+                if cls == "pointer":
+                    slaves_pointers.append(dev_info)
+                elif cls == "keyboard":
                     slaves_keyboards.append(dev_info)
 
         # Associate slaves to masters

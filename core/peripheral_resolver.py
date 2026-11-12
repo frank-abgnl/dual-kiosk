@@ -218,6 +218,8 @@ class PeripheralResolver:
 
                 def attach_bonus(sl, c) -> int:
                     att, b = c.get("attachment"), 0
+                    if att is None:
+                        return 0
                     if not sl["primary"] and sl["mine"] is not None and att == sl["mine"]:
                         b += 12            # already sitting on this seat's master
                     if sl["primary"] and att == CORE[cls]:
