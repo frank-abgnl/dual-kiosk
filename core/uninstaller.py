@@ -106,7 +106,7 @@ class Uninstaller:
             if pid != me and "firefox" in " ".join(argv).lower() and prof in " ".join(argv)
         ]
 
-    def _terminate(self, pids: List[int], label: str):
+    def _terminate(self, pids: List[int], label: str, timeout: float = 12.0):
         if not pids:
             self._say(f"    No {label} running.")
             return
@@ -118,7 +118,7 @@ class Uninstaller:
                 os.kill(pid, signal.SIGTERM)
             except OSError:
                 pass
-        deadline = time.time() + 4
+        deadline = time.time() + timeout
         while time.time() < deadline:
             if not any(self._alive(p) for p in pids):
                 return
@@ -197,16 +197,21 @@ class Uninstaller:
     # ------------------------------------------------------------------
     def run(self) -> bool:
         tag = " (dry run)" if self.dry_run else ""
-        self._say(f"[1/4] Stopping supervisors{tag}...")
+        self._say(f"[1/5] Restoring original keymaps{tag}...")
+        from core.kiosk_shield import restore_all_keymaps
+        if not self.dry_run:
+            restore_all_keymaps()
+
+        self._say(f"[2/5] Stopping supervisors{tag}...")
         self._terminate(self.find_supervisors(), "supervisor/GUI processes")
 
-        self._say(f"[2/4] Stopping Firefox kiosks{tag}...")
+        self._say(f"[3/5] Stopping Firefox kiosks{tag}...")
         self._terminate(self.find_kiosks(), "kiosk browsers")
 
-        self._say(f"[3/4] Resetting XInput seating{tag}...")
+        self._say(f"[4/5] Resetting XInput seating{tag}...")
         self.reset_xinput()
 
-        self._say(f"[4/4] Removing configuration and launchers{tag}...")
+        self._say(f"[5/5] Removing configuration and launchers{tag}...")
         self.remove_files()
 
         self._say("[✓] Uninstall complete. System is back to its pre-setup state." if not self.dry_run

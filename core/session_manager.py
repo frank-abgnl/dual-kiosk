@@ -153,6 +153,15 @@ class SessionManager:
             except Exception:
                 pass
             self.hotkey_mgr = None
+        try:
+            self.kiosk.stop_shield()
+        except Exception:
+            pass
+        try:
+            from core.kiosk_shield import restore_all_keymaps
+            restore_all_keymaps()
+        except Exception:
+            pass
 
     # -----------------------------------------------------------------------
     # Unified Shut-Down Wrapper

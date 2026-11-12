@@ -65,9 +65,29 @@ def patch_super_keys(xkb_text: str) -> Tuple[str, int]:
     return "".join(out), count
 
 
+def restore_all_keymaps() -> bool:
+    """
+    Restores original keymaps for all master keyboards from backups in KEYMAP_DIR.
+    Safe and best-effort; never raises.
+    """
+    disp = os.environ.get("DISPLAY") or ":0"
+    restored = False
+    if KEYMAP_DIR.exists():
+        for backup in KEYMAP_DIR.glob("orig_*.xkb"):
+            try:
+                dev = backup.stem.split("_", 1)[1]
+                _run(["xkbcomp", "-i", str(dev), "-w", "0", str(backup), disp], timeout=5)
+                restored = True
+            except Exception as exc:
+                logger.warning(f"Error restoring keymap from {backup}: {exc}")
+    if restored:
+        logger.info("Original keymaps restored (Super key works again).")
+    return restored
+
+
 class KioskShield:
     POLICE_INTERVAL = 0.25
-    KEYMAP_INTERVAL = 2.0
+    KEYMAP_INTERVAL = 15.0
     ACT_COOLDOWN = 0.5
 
     def __init__(self, kiosk_mgr, engine=None):
@@ -114,6 +134,7 @@ class KioskShield:
             "enabled": st.get("kiosk_shield", True),
             "super": st.get("block_super_key", True),
             "police": st.get("police_windows", True),
+            "keymap_interval": float(st.get("shield_keymap_interval", 15.0)),
             "ignore": tuple(str(c).lower() for c in st.get("shield_ignore_classes", DEFAULT_IGNORE_CLASSES)),
         }
 
@@ -129,7 +150,7 @@ class KioskShield:
                     S, last_cfg = self._settings(), now
                 if not S["enabled"]:
                     continue
-                if S["super"] and now - last_keys > self.KEYMAP_INTERVAL:
+                if S["super"] and now - last_keys > S.get("keymap_interval", self.KEYMAP_INTERVAL):
                     last_keys = now
                     try:
                         self._enforce_keymaps()
@@ -177,13 +198,17 @@ class KioskShield:
         disp = os.environ.get("DISPLAY") or ":0"
         for dev in self._master_keyboards():
             dump = KEYMAP_DIR / f"dump_{dev}.xkb"
-            _, _, rc = _run(["xkbcomp", "-i", str(dev), "-xkb", "-w", "0", disp, str(dump)])
+            t0 = time.time()
+            _, _, rc = _run(["xkbcomp", "-i", str(dev), "-xkb", "-w", "0", disp, str(dump)], timeout=5)
             if rc != 0 or not dump.exists():
+                continue
+            if time.time() - t0 > 1.0:
+                logger.debug(f"xkbcomp dump took > 1s on dev {dev}, skipping re-apply.")
                 continue
             text = dump.read_text(errors="replace")
             patched, n = patch_super_keys(text)
             if n == 0:
-                continue  # already neutral
+                continue  # already neutral: no Super keys in xkb_symbols
             if dev not in self._backups:
                 backup = KEYMAP_DIR / f"orig_{dev}.xkb"
                 backup.write_text(text)
@@ -197,15 +222,7 @@ class KioskShield:
                 logger.warning(f"Could not load patched keymap on device {dev}: {err}")
 
     def _restore_keymaps(self):
-        disp = os.environ.get("DISPLAY") or ":0"
-        restored = False
-        if KEYMAP_DIR.exists():
-            for backup in KEYMAP_DIR.glob("orig_*.xkb"):
-                dev = backup.stem.split("_", 1)[1]
-                _run(["xkbcomp", "-i", str(dev), "-w", "0", str(backup), disp])
-                restored = True
-        if restored or self._backups:
-            logger.info("Original keymaps restored (Super key works again).")
+        restore_all_keymaps()
         self._backups.clear()
 
     # ------------------------------------------------------------------

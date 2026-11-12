@@ -175,6 +175,7 @@ The application can be driven entirely from the command line (e.g. for systemd s
 | `./start.sh --start` | Apply seating mappings and launch kiosks with supervisor |
 | `./start.sh --stop` | Terminate all kiosks and reset XInput devices to core |
 | `./start.sh --reset-devices` | Reset XInput devices to core without touching kiosks |
+| `./start.sh --restore-keymaps` | Restore original XKB keymaps (re-enables Super key) |
 | `./start.sh --overlay` | Launch or show Control Board GUI in overlay mode on top of kiosk mode |
 | `./start.sh --toggle-overlay --seat seat2` | Toggle Control Board GUI overlay on a specific seat via IPC or launch |
 | `./start.sh --uninstall` | Fully restore system to pre-setup state (removes masters, configs, profiles) |

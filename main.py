@@ -187,6 +187,7 @@ def main():
     parser.add_argument("--overlay", action="store_true", help="Launch Control Board GUI in overlay mode on top of kiosk mode")
     parser.add_argument("--seat", default="seat1", help="Target seat for overlay mode (default: seat1)")
     parser.add_argument("--toggle-overlay", action="store_true", help="Toggle Control Board overlay on target seat via IPC or launch")
+    parser.add_argument("--restore-keymaps", action="store_true", help="Restore original XKB keymaps (re-enables Super key) and exit")
     parser.add_argument("--uninstall", action="store_true",
                         help="Terminate everything, reset XInput, and remove configs/profiles/launchers")
     parser.add_argument("--yes", "-y", action="store_true", help="Skip the confirmation prompt (with --uninstall)")
@@ -195,6 +196,14 @@ def main():
     parser.add_argument("--dry-run", action="store_true", help="Show what --uninstall would do without changing anything")
 
     args = parser.parse_args()
+
+    # Restore keymaps option
+    if args.restore_keymaps:
+        from core.kiosk_shield import restore_all_keymaps
+        print("[*] Restoring original XKB keymaps...")
+        restore_all_keymaps()
+        print("[✓] Original keymaps restored.")
+        return
 
     # Uninstall is handled first without constructing managers
     if args.uninstall:
@@ -228,10 +237,15 @@ def main():
     try:
         import gi
         gi.require_version('Gtk', '3.0')
-        from gi.repository import Gtk
+        from gi.repository import Gtk, GLib
         from gui.app import XInputMultiseatApp
 
         app = XInputMultiseatApp(overlay_mode=args.overlay, target_seat=args.seat or "seat1")
+        for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+            try:
+                signal.signal(sig, lambda *_: GLib.idle_add(app.destroy))
+            except Exception:
+                pass
         app.show_all()
         Gtk.main()
     except Exception as exc:
