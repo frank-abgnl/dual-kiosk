@@ -15,16 +15,121 @@ from typing import Callable, Dict, List, Optional
 
 logger = logging.getLogger("xinput_seating.config")
 
-from core.paths import CONFIG_DIR, CONFIG_FILE
+from core.paths import CONFIG_DIR, CONFIG_FILE, RUNTIME_FILE
+
+VOLATILE_SEAT_KEYS = {
+    "mouse_id",
+    "keyboard_id",
+    "mouse_connected",
+    "keyboard_connected",
+    "pointer_connected",
+    "resolution",
+    "width",
+    "height",
+}
+
+VOLATILE_ROOT_KEYS = {
+    "display_layout",
+}
 
 
 class ConfigManager:
-    """Handles loading, saving, validating, and auto-generating multiseat configurations."""
+    """Handles loading, saving, validating, auto-generating, and runtime state separation."""
 
-    def __init__(self, config_path: Optional[Path] = None):
+    def __init__(self, config_path: Optional[Path] = None, runtime_path: Optional[Path] = None):
         self.config_path = config_path or CONFIG_FILE
         self.config_dir = self.config_path.parent
         self.lock_path = self.config_dir / "config.lock"
+        self.runtime_path = runtime_path or (self.config_dir / "runtime.json" if config_path else RUNTIME_FILE)
+
+    @classmethod
+    def migrate(cls, cfg: Dict) -> Tuple[Dict, Dict]:
+        """
+        Migrates old configuration format:
+        Moves volatile runtime keys (mouse_id, keyboard_id, *_connected, display_layout, resolution)
+        to a runtime dictionary, strips them from the config dictionary, and ensures version is set.
+        Returns (cleaned_config, runtime_dict).
+        """
+        clean_cfg = json.loads(json.dumps(cfg)) if isinstance(cfg, dict) else {}
+        clean_cfg["version"] = clean_cfg.get("version", "1.0")
+
+        runtime_dict: Dict = {"seats": {}}
+
+        # Move root volatile keys
+        for k in list(clean_cfg.keys()):
+            if k in VOLATILE_ROOT_KEYS:
+                runtime_dict[k] = clean_cfg.pop(k)
+
+        # Move seat volatile keys
+        if "seats" in clean_cfg and isinstance(clean_cfg["seats"], list):
+            for seat in clean_cfg["seats"]:
+                if not isinstance(seat, dict):
+                    continue
+                sid = seat.get("id", "unknown")
+                seat_runtime = {}
+                for vk in list(seat.keys()):
+                    if vk in VOLATILE_SEAT_KEYS or vk.endswith("_connected"):
+                        seat_runtime[vk] = seat.pop(vk)
+                if seat_runtime:
+                    runtime_dict["seats"][sid] = seat_runtime
+
+        return clean_cfg, runtime_dict
+
+    def load_runtime(self) -> Dict:
+        """Loads volatile runtime state from runtime_path."""
+        if not self.runtime_path.exists():
+            return {"seats": {}}
+        try:
+            with open(self.runtime_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return data if isinstance(data, dict) else {"seats": {}}
+        except Exception as exc:
+            logger.debug(f"Failed to load runtime state from {self.runtime_path}: {exc}")
+            return {"seats": {}}
+
+    def save_runtime(self, runtime_dict: Dict) -> bool:
+        """Saves runtime state atomically to runtime_path."""
+        try:
+            self.runtime_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp_path = self.runtime_path.with_suffix(".json.tmp")
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(runtime_dict, f, indent=2)
+            os.replace(tmp_path, self.runtime_path)
+            return True
+        except Exception as exc:
+            logger.error(f"Failed to save runtime state to {self.runtime_path}: {exc}")
+            return False
+
+    def update_runtime(self, mutator: Callable[[Dict], None]) -> Dict:
+        """
+        Thread-safe and process-safe read-modify-write on runtime state.
+        Acquires exclusive flock on runtime.lock.
+        """
+        self.runtime_path.parent.mkdir(parents=True, exist_ok=True)
+        lock_file = self.runtime_path.parent / "runtime.lock"
+        with open(lock_file, "a+", encoding="utf-8") as lock_f:
+            fcntl.flock(lock_f.fileno(), fcntl.LOCK_EX)
+            try:
+                state = self.load_runtime()
+                mutator(state)
+                self.save_runtime(state)
+                return state
+            finally:
+                fcntl.flock(lock_f.fileno(), fcntl.LOCK_UN)
+
+    def _merge_runtime(self, cfg: Dict) -> Dict:
+        """Merges volatile runtime values into a copy of cfg without altering disk config."""
+        res = json.loads(json.dumps(cfg))
+        runtime = self.load_runtime()
+        for k in VOLATILE_ROOT_KEYS:
+            if k in runtime:
+                res[k] = runtime[k]
+        seat_runtimes = runtime.get("seats", {})
+        for s in res.get("seats", []):
+            sid = s.get("id")
+            if sid in seat_runtimes:
+                s.update(seat_runtimes[sid])
+        return res
 
     def get_default_config(self) -> Dict:
         """Returns the default configuration template."""
@@ -73,20 +178,34 @@ class ConfigManager:
             },
         }
 
-    def load_config(self) -> Dict:
+    def load_config(self, include_runtime: bool = True) -> Dict:
         """Loads configuration from JSON file or returns default if not present."""
         if not self.config_path.exists():
             logger.info(f"Config file not found at {self.config_path}; generating default.")
             cfg = self.get_default_config()
             self.save_config(cfg)
-            return cfg
+            return self._merge_runtime(cfg) if include_runtime else cfg
 
         try:
             with open(self.config_path, "r", encoding="utf-8") as f:
                 data = json.load(f)
             if not isinstance(data, dict):
                 raise ValueError("Config root must be a JSON object")
-            return data
+
+            has_volatile = any(
+                any(vk in s for vk in VOLATILE_SEAT_KEYS)
+                for s in data.get("seats", [])
+                if isinstance(s, dict)
+            ) or any(k in VOLATILE_ROOT_KEYS for k in data)
+
+            if has_volatile or "version" not in data:
+                cleaned_cfg, runtime_state = self.migrate(data)
+                if runtime_state.get("seats") or any(k in runtime_state for k in VOLATILE_ROOT_KEYS):
+                    self.update_runtime(lambda r: r.update(runtime_state))
+                self.save_config(cleaned_cfg)
+                data = cleaned_cfg
+
+            return self._merge_runtime(data) if include_runtime else data
         except (json.JSONDecodeError, ValueError) as exc:
             ts = int(time.time())
             corrupt_path = self.config_dir / f"config.json.corrupt-{ts}"
@@ -105,22 +224,26 @@ class ConfigManager:
                     if isinstance(bak_data, dict):
                         logger.info(f"Recovered configuration from {bak_path}")
                         self.save_config(bak_data)
-                        return bak_data
+                        return self._merge_runtime(bak_data) if include_runtime else bak_data
                 except Exception as bak_exc:
                     logger.warning(f"Could not load backup config {bak_path}: {bak_exc}")
 
             logger.info("Falling back to default configuration.")
             cfg = self.get_default_config()
             self.save_config(cfg)
-            return cfg
+            return self._merge_runtime(cfg) if include_runtime else cfg
         except Exception as exc:
             logger.error(f"Error reading {self.config_path}: {exc}; falling back to default.")
             return self.get_default_config()
 
     def save_config(self, config_dict: Dict) -> bool:
-        """Saves configuration dict atomically to JSON file with backup."""
+        """Saves configuration dict atomically to JSON file with backup and runtime separation."""
         try:
             self.config_dir.mkdir(parents=True, exist_ok=True)
+            clean_cfg, runtime_state = self.migrate(config_dict)
+            if runtime_state.get("seats") or any(k in runtime_state for k in VOLATILE_ROOT_KEYS):
+                self.update_runtime(lambda r: r.update(runtime_state))
+
             # Create backup of current config if it exists
             bak_path = self.config_path.with_name(self.config_path.name + ".bak")
             if self.config_path.exists():
@@ -131,7 +254,7 @@ class ConfigManager:
 
             tmp_path = self.config_path.with_suffix(".json.tmp")
             with open(tmp_path, "w", encoding="utf-8") as f:
-                json.dump(config_dict, f, indent=2)
+                json.dump(clean_cfg, f, indent=2)
             os.replace(tmp_path, self.config_path)
             logger.info(f"Config successfully saved to {self.config_path}")
             return True
