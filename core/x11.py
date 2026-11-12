@@ -51,6 +51,31 @@ class _XIRawEvent(ctypes.Structure):
     ]
 
 
+class _XIModifierState(ctypes.Structure):
+    _fields_ = [
+        ("base", ctypes.c_int),
+        ("latched", ctypes.c_int),
+        ("locked", ctypes.c_int),
+        ("effective", ctypes.c_int),
+    ]
+
+
+class _XIGroupState(ctypes.Structure):
+    _fields_ = [
+        ("base", ctypes.c_int),
+        ("latched", ctypes.c_int),
+        ("locked", ctypes.c_int),
+        ("effective", ctypes.c_int),
+    ]
+
+
+class _XIButtonState(ctypes.Structure):
+    _fields_ = [
+        ("mask_len", ctypes.c_int),
+        ("mask", ctypes.c_void_p),
+    ]
+
+
 class _XEvent(ctypes.Union):
     _fields_ = [
         ("type", ctypes.c_int),
@@ -127,6 +152,8 @@ def load_x11() -> Tuple[ctypes.CDLL, ctypes.CDLL, ctypes.CDLL]:
         x11.XKeysymToKeycode.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
         x11.XKeycodeToKeysym.restype = ctypes.c_ulong
         x11.XKeycodeToKeysym.argtypes = [ctypes.c_void_p, ctypes.c_ubyte, ctypes.c_int]
+        x11.XFree.restype = ctypes.c_int
+        x11.XFree.argtypes = [ctypes.c_void_p]
 
         x11.XSetErrorHandler.restype = ctypes.c_void_p
         x11.XSetErrorHandler.argtypes = [_XERROR_HANDLER_PROTO]
@@ -138,6 +165,21 @@ def load_x11() -> Tuple[ctypes.CDLL, ctypes.CDLL, ctypes.CDLL]:
             ctypes.c_ulong,
             ctypes.POINTER(_XIEventMask),
             ctypes.c_int,
+        ]
+        xi.XIQueryPointer.restype = ctypes.c_int
+        xi.XIQueryPointer.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_int,
+            ctypes.c_ulong,
+            ctypes.POINTER(ctypes.c_ulong),
+            ctypes.POINTER(ctypes.c_ulong),
+            ctypes.POINTER(ctypes.c_double),
+            ctypes.POINTER(ctypes.c_double),
+            ctypes.POINTER(ctypes.c_double),
+            ctypes.POINTER(ctypes.c_double),
+            ctypes.POINTER(_XIButtonState),
+            ctypes.POINTER(_XIModifierState),
+            ctypes.POINTER(_XIGroupState),
         ]
         xi.XIWarpPointer.restype = ctypes.c_int
         xi.XIWarpPointer.argtypes = [
