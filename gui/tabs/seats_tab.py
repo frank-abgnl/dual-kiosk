@@ -345,11 +345,53 @@ class SeatsTab(Gtk.Box):
         s2_data = self.card_seat2.get_configured_data(
             self._cached_displays, self._cached_pointers, self._cached_keyboards
         )
+        new_seats = [s1_data, s2_data]
 
-        cfg = self.app.config_mgr.load_config()
-        cfg["seats"] = [s1_data, s2_data]
+        def _merge_seat(existing: dict, updated: dict) -> dict:
+            merged = dict(existing)
+            merged.update(updated)
 
-        ok = self.app.config_mgr.save_config(cfg)
+            # Preserve device identities, product IDs, and display geometry
+            for field in (
+                "mouse_ident",
+                "keyboard_ident",
+                "mouse_product_id",
+                "keyboard_product_id",
+                "resolution",
+                "width",
+                "height",
+            ):
+                if field in existing and field not in updated:
+                    merged[field] = existing[field]
+                elif field in existing and updated.get(field) in (None, ""):
+                    if "mouse" in field and existing.get("mouse_name") == updated.get("mouse_name"):
+                        merged[field] = existing[field]
+                    elif "keyboard" in field and existing.get("keyboard_name") == updated.get("keyboard_name"):
+                        merged[field] = existing[field]
+
+            return merged
+
+        def mutator(cfg: dict):
+            current_seats = cfg.get("seats", [])
+            merged_list = []
+            for i, new_s in enumerate(new_seats):
+                sid = new_s.get("id")
+                existing = next((s for s in current_seats if s.get("id") == sid), None)
+                if existing is None and i < len(current_seats):
+                    existing = current_seats[i]
+                if existing:
+                    merged_list.append(_merge_seat(existing, new_s))
+                else:
+                    merged_list.append(dict(new_s))
+            cfg["seats"] = merged_list
+
+        try:
+            self.app.config_mgr.update(mutator)
+            ok = True
+        except Exception as exc:
+            logger.error(f"Failed to save config: {exc}")
+            ok = False
+
         if ok:
             self.app.show_info("Configuration saved successfully ✓", 0)
             self.app.dashboard_tab.append_log("Configuration saved to ~/.config/xinput-seats/config.json")
