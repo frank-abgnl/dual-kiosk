@@ -41,6 +41,10 @@ class XInputSeatingEngine:
     CORE_POINTER_ID = 2
     CORE_KEYBOARD_ID = 3
 
+    @staticmethod
+    def master_name(seat_id: str) -> str:
+        return f"Seat_{seat_id.upper()}"
+
     def __init__(self):
         # Holds XFixes pointer barriers; they live as long as this process.
         self.confiner = PointerConfiner()
@@ -54,10 +58,6 @@ class XInputSeatingEngine:
         self.manual_hold_until: float = 0.0
         self._last_refresh = 0.0
         self._hotplug_lock = threading.Lock()
-
-    @staticmethod
-    def master_name(seat_id: str) -> str:
-        return f"Seat_{seat_id.upper()}"
         self._verified_sig = None                          # topology we already verified
         self._attempts: Dict[tuple, int] = {}
         self._last_reseat: Dict[Tuple[str, str], float] = {}

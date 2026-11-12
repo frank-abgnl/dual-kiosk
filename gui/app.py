@@ -16,10 +16,6 @@ from pathlib import Path
 from typing import Optional
 
 from core import overlay_state
-from core.config_manager import ConfigManager
-from core.device_manager import DeviceManager
-from core.kiosk_manager import KioskManager
-from core.xinput_seating import XInputSeatingEngine
 from core.session_manager import session_mgr, get_supervisor_pid
 from core.hotkey_manager import OverlayIPCServer, get_seat_screen_geometry
 from gui.styles import CSS_STYLES
@@ -48,13 +44,18 @@ class XInputMultiseatApp(Gtk.ApplicationWindow):
         # Set to True if opening the GUI should also start the kiosks automatically.
         self._auto_start_session = False
 
-        # ── Initialize Core Engines ───────────────────────────────────────
-        self.device_mgr = DeviceManager()
-        self.seating_engine = XInputSeatingEngine()
-        self.kiosk_mgr = KioskManager()
-        self.config_mgr = ConfigManager()
-        self.kiosk_mgr.on_window_ready = self.seating_engine.focus_seat_keyboard
-        self.kiosk_mgr.engine = self.seating_engine
+        # ── Core Engines (Single Owner: session_mgr) ──────────────────────
+        self.device_mgr = session_mgr.dm
+        self.seating_engine = session_mgr.engine
+        self.kiosk_mgr = session_mgr.kiosk
+        self.config_mgr = session_mgr.cfg_mgr
+
+        # When running as client of supervisor, discover existing masters
+        if get_supervisor_pid():
+            try:
+                self.seating_engine.discover_masters(self.config_mgr.load_config().get("seats", []))
+            except Exception as exc:
+                logger.debug(f"Master discovery notice: {exc}")
 
         # Discover already running kiosks (if any)
         self.kiosk_mgr.discover_running_kiosks()
