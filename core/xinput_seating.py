@@ -51,8 +51,13 @@ class XInputSeatingEngine:
         self.owns_seating = False
         self.memory = PeripheralMemory()                   # short-term seat memory + stand-in clocks
         self.resolver = PeripheralResolver(self._promote_after())
+        self.manual_hold_until: float = 0.0
         self._last_refresh = 0.0
         self._hotplug_lock = threading.Lock()
+
+    @staticmethod
+    def master_name(seat_id: str) -> str:
+        return f"Seat_{seat_id.upper()}"
         self._verified_sig = None                          # topology we already verified
         self._attempts: Dict[tuple, int] = {}
         self._last_reseat: Dict[Tuple[str, str], float] = {}
@@ -85,11 +90,13 @@ class XInputSeatingEngine:
 
         return masters
 
-    def create_master_pair(self, seat_name: str = "Seat2") -> Tuple[Optional[int], Optional[int]]:
+    def create_master_pair(self, seat_name: Optional[str] = None) -> Tuple[Optional[int], Optional[int]]:
         """
         Creates a master pointer and master keyboard pair via `xinput create-master`.
         Returns (master_pointer_id, master_keyboard_id).
         """
+        if seat_name is None:
+            seat_name = self.master_name("seat2")
         masters = self.get_existing_masters()
         if seat_name in masters:
             logger.info(f"Master pair for '{seat_name}' already exists: {masters[seat_name]}")
@@ -116,8 +123,10 @@ class XInputSeatingEngine:
 
         return None, None
 
-    def remove_master_pair(self, seat_name: str = "Seat2") -> bool:
+    def remove_master_pair(self, seat_name: Optional[str] = None) -> bool:
         """Removes a master pointer (which also removes its paired keyboard)."""
+        if seat_name is None:
+            seat_name = self.master_name("seat2")
         ptr_target = f"{seat_name} pointer"
         logger.info(f"Removing master pair '{ptr_target}'...")
         _, err, rc = run_command(["xinput", "remove-master", ptr_target])
@@ -309,7 +318,7 @@ class XInputSeatingEngine:
                 self.seat_pointers[sid], self.seat_keyboards[sid] = self.CORE_POINTER_ID, self.CORE_KEYBOARD_ID
                 found = True
             else:
-                m = masters.get(f"Seat_{sid.upper()}")
+                m = masters.get(self.master_name(sid))
                 if m:
                     self.seat_pointers[sid], self.seat_keyboards[sid] = m["pointer_id"], m["keyboard_id"]
                     found = True
@@ -460,7 +469,7 @@ class XInputSeatingEngine:
                 master_ptr = self.CORE_POINTER_ID
                 master_kbd = self.CORE_KEYBOARD_ID
             else:
-                master_name = f"Seat_{seat_id.upper()}"
+                master_name = self.master_name(seat_id)
                 ptr_id, kbd_id = self.create_master_pair(master_name)
                 master_ptr = ptr_id or f"{master_name} pointer"
                 master_kbd = kbd_id or f"{master_name} keyboard"
@@ -509,6 +518,8 @@ class XInputSeatingEngine:
         Returns human-readable messages.
         """
         if not self.owns_seating:
+            return []
+        if time.time() < self.manual_hold_until:
             return []
         if not self._hotplug_lock.acquire(blocking=False):
             return []
@@ -684,7 +695,7 @@ class XInputSeatingEngine:
 
         if not master_ptr or not master_kbd:
             if not is_primary:
-                ptr_id, kbd_id = self.create_master_pair(f"Seat_{sid.upper()}")
+                ptr_id, kbd_id = self.create_master_pair(self.master_name(sid))
                 master_ptr = ptr_id or master_ptr
                 master_kbd = kbd_id or master_kbd
                 if ptr_id:
