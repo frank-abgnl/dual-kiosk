@@ -8,6 +8,7 @@ Enforces non-minimizable, non-closable kiosk mode with an automated watchdog sup
 import subprocess
 import os
 import re
+import shutil
 import time
 import threading
 import logging
@@ -59,6 +60,39 @@ def validate_kiosk_url(url: str) -> str:
     return clean
 
 
+def should_reset(last_input_ts: float, now: float, minutes: int) -> bool:
+    """
+    Pure function determining if an idle privacy reset is due.
+    minutes <= 0 disables reset.
+    Returns True if elapsed time (now - last_input_ts) >= minutes * 60.
+    """
+    if minutes <= 0 or last_input_ts <= 0:
+        return False
+    if now < last_input_ts:
+        return False
+    return (now - last_input_ts) >= (minutes * 60)
+
+
+def reset_profile_data(profile_path: Path):
+    """
+    Cleans browser cache, cookies, session history from the profile directory,
+    retaining user.js preferences and distribution policies.
+    """
+    if not profile_path.exists():
+        return
+    preserved = {"user.js", "distribution"}
+    for item in profile_path.iterdir():
+        if item.name in preserved:
+            continue
+        try:
+            if item.is_dir() and not item.is_symlink():
+                shutil.rmtree(item, ignore_errors=True)
+            else:
+                item.unlink(missing_ok=True)
+        except Exception as exc:
+            logger.debug(f"Could not remove {item} during profile reset: {exc}")
+
+
 class KioskManager:
     """Manages multi-screen Firefox kiosk sessions and enforces window restrictions."""
 
@@ -78,8 +112,53 @@ class KioskManager:
         self._demoted_fs: Dict[str, bool] = {}  # seat -> True if we removed fullscreen for the overlay
         self.shield = None   # KioskShield (Super-key block + window policing)
         self.engine = None   # XInputSeatingEngine (falls back to on_window_ready's owner)
+        self.idle_reset_minutes: int = 0
+        self.last_input_ts: Dict[str, float] = {}
 
         PROFILES_DIR.mkdir(parents=True, exist_ok=True)
+
+    def record_input(self, seat_id: str, ts: Optional[float] = None):
+        """Updates the last recorded user activity timestamp for a seat."""
+        self.last_input_ts[seat_id] = ts if ts is not None else time.time()
+
+    def reset_seat_kiosk(self, seat_id: str) -> bool:
+        """Restarts a seat's Firefox kiosk with a wiped profile (privacy reset)."""
+        logger.info(f"Resetting seat '{seat_id}' kiosk profile for privacy...")
+        cfg = self.kiosk_configs.get(seat_id, {})
+        profile_name = cfg.get("profile_name", seat_id)
+        prof_path = self.get_profile_path(seat_id, profile_name=profile_name)
+
+        # 1. Terminate current process
+        self._terminate_seat_process(seat_id)
+
+        # 2. Reset profile data (preserve user.js and distribution/)
+        reset_profile_data(prof_path)
+
+        # 3. Re-launch kiosk
+        ok = self.launch_kiosk(
+            seat_id=seat_id,
+            kiosk_url=cfg.get("kiosk_url", "https://duckduckgo.com"),
+            monitor_index=cfg.get("monitor_index", 0),
+            display_geometry=cfg.get("display_geometry"),
+            enforce_lock=cfg.get("enforce_lock", True),
+            auto_respawn=cfg.get("auto_respawn", True),
+            profile_name=profile_name,
+        )
+        self.record_input(seat_id)
+        return ok
+
+    def check_idle_resets(self, now: Optional[float] = None):
+        """Checks if any active seat has exceeded idle_reset_minutes."""
+        if self.idle_reset_minutes <= 0:
+            return
+        current_time = now if now is not None else time.time()
+        with self._lock:
+            active_seats = [s for s in self.kiosk_configs.keys() if s not in self.sleeping_cfgs]
+
+        for seat_id in active_seats:
+            last = self.last_input_ts.get(seat_id, current_time)
+            if should_reset(last, current_time, self.idle_reset_minutes):
+                self.reset_seat_kiosk(seat_id)
 
     # -----------------------------------------------------------------------
     # Profile Setup & Lockdown
@@ -214,6 +293,7 @@ user_pref("app.update.enabled", false);
                     "auto_respawn": auto_respawn,
                     "profile_name": profile_name or seat_id,
                 }
+                self.record_input(seat_id)
             except Exception as exc:
                 logger.error(f"Failed to spawn Firefox for seat '{seat_id}': {exc}")
                 return False
@@ -391,6 +471,8 @@ user_pref("app.update.enabled", false);
         """Respawns killed instances / unminimizes hidden ones, except on whitelisted (overlay) seats."""
         while not self._stop_watchdog.is_set():
             time.sleep(interval_sec)
+
+            self.check_idle_resets()
 
             with self._lock:
                 active_seats = [s for s in self.kiosk_configs.keys() if s not in self.sleeping_cfgs]

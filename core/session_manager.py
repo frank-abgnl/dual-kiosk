@@ -377,6 +377,7 @@ class SessionManager:
         s1_url = seats[0].get("kiosk_url") if len(seats) > 0 else "https://duckduckgo.com"
         s2_url = seats[1].get("kiosk_url") if len(seats) > 1 else "https://www.google.com"
         watchdog_interval = float(settings.get("watchdog_interval_sec", 1.5))
+        self.kiosk.idle_reset_minutes = int(settings.get("idle_reset_minutes", 0))
 
         ok = self.kiosk.launch_dual_kiosks(
             seat1_url=s1_url or "https://duckduckgo.com",

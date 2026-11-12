@@ -175,6 +175,7 @@ class ConfigManager:
                 "watchdog_interval_sec": 1.5,
                 "lock_peripherals_to_displays": True,
                 "hotplug_auto_reseat": True,
+                "idle_reset_minutes": 0,
             },
         }
 
