@@ -4,10 +4,14 @@ Configuration Manager for XInput Pseudo-Seating.
 Stores and validates JSON configurations.
 """
 
+import fcntl
 import json
 import logging
+import os
 from pathlib import Path
-from typing import Dict, List, Optional
+import shutil
+import time
+from typing import Callable, Dict, List, Optional
 
 logger = logging.getLogger("xinput_seating.config")
 
@@ -20,6 +24,7 @@ class ConfigManager:
     def __init__(self, config_path: Optional[Path] = None):
         self.config_path = config_path or CONFIG_FILE
         self.config_dir = self.config_path.parent
+        self.lock_path = self.config_dir / "config.lock"
 
     def get_default_config(self) -> Dict:
         """Returns the default configuration template."""
@@ -79,15 +84,51 @@ class ConfigManager:
         try:
             with open(self.config_path, "r", encoding="utf-8") as f:
                 data = json.load(f)
+            if not isinstance(data, dict):
+                raise ValueError("Config root must be a JSON object")
             return data
+        except (json.JSONDecodeError, ValueError) as exc:
+            ts = int(time.time())
+            corrupt_path = self.config_dir / f"config.json.corrupt-{ts}"
+            logger.error(f"Corrupt config at {self.config_path}: {exc}. Moving to {corrupt_path}")
+            try:
+                shutil.move(str(self.config_path), str(corrupt_path))
+            except Exception as move_exc:
+                logger.warning(f"Could not move corrupt config: {move_exc}")
+
+            # Try loading from backup
+            bak_path = self.config_path.with_name(self.config_path.name + ".bak")
+            if bak_path.exists():
+                try:
+                    with open(bak_path, "r", encoding="utf-8") as f:
+                        bak_data = json.load(f)
+                    if isinstance(bak_data, dict):
+                        logger.info(f"Recovered configuration from {bak_path}")
+                        self.save_config(bak_data)
+                        return bak_data
+                except Exception as bak_exc:
+                    logger.warning(f"Could not load backup config {bak_path}: {bak_exc}")
+
+            logger.info("Falling back to default configuration.")
+            cfg = self.get_default_config()
+            self.save_config(cfg)
+            return cfg
         except Exception as exc:
             logger.error(f"Error reading {self.config_path}: {exc}; falling back to default.")
             return self.get_default_config()
 
     def save_config(self, config_dict: Dict) -> bool:
-        """Saves configuration dict atomically to JSON file."""
+        """Saves configuration dict atomically to JSON file with backup."""
         try:
-            import os
+            self.config_dir.mkdir(parents=True, exist_ok=True)
+            # Create backup of current config if it exists
+            bak_path = self.config_path.with_name(self.config_path.name + ".bak")
+            if self.config_path.exists():
+                try:
+                    shutil.copy2(str(self.config_path), str(bak_path))
+                except Exception as bak_exc:
+                    logger.debug(f"Could not create config backup: {bak_exc}")
+
             tmp_path = self.config_path.with_suffix(".json.tmp")
             with open(tmp_path, "w", encoding="utf-8") as f:
                 json.dump(config_dict, f, indent=2)
@@ -97,6 +138,23 @@ class ConfigManager:
         except Exception as exc:
             logger.error(f"Failed to save config to {self.config_path}: {exc}")
             return False
+
+    def update(self, mutator: Callable[[Dict], None]) -> Dict:
+        """
+        Thread-safe and process-safe read-modify-write on configuration.
+        Acquires exclusive flock on config.lock, loads current config,
+        applies mutator(cfg), saves the result atomically, and returns the updated config.
+        """
+        self.config_dir.mkdir(parents=True, exist_ok=True)
+        with open(self.lock_path, "a+", encoding="utf-8") as lock_f:
+            fcntl.flock(lock_f.fileno(), fcntl.LOCK_EX)
+            try:
+                cfg = self.load_config()
+                mutator(cfg)
+                self.save_config(cfg)
+                return cfg
+            finally:
+                fcntl.flock(lock_f.fileno(), fcntl.LOCK_UN)
 
     def auto_generate_config(self, device_manager, force_reassign: bool = False) -> Dict:
         """
