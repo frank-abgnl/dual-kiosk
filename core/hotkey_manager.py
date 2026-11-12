@@ -156,12 +156,20 @@ def resolve_seat_for_device(
     master_id: int,
     slave_id: int,
     seats: Optional[List[Dict]] = None,
-    seat_keyboards: Optional[Dict[str, int]] = None,
+    seat_keyboards: Optional[Union[Dict[str, int], Callable[[], Dict[str, int]]]] = None,
 ) -> str:
     """
     Determines which seat triggered a hotkey event based on the master keyboard ID,
     slave device ID, USB hierarchy, or seat configurations.
     """
+    if callable(seat_keyboards):
+        try:
+            kbds = seat_keyboards()
+        except Exception:
+            kbds = None
+    else:
+        kbds = seat_keyboards
+
     if seats is None:
         try:
             from core.config_manager import ConfigManager
@@ -170,8 +178,8 @@ def resolve_seat_for_device(
             seats = []
 
     # 1. Match active master keyboard ID
-    if seat_keyboards:
-        for sid, kbd_id in seat_keyboards.items():
+    if kbds:
+        for sid, kbd_id in kbds.items():
             if kbd_id == master_id:
                 return sid
 
@@ -267,19 +275,30 @@ class HotkeyManager:
         on_trigger: Optional[Callable[[str, int, int], None]] = None,
         on_device_changed: Optional[Callable[[], None]] = None,
         launch_gui_if_needed: bool = False,
-        seat_keyboards: Optional[Dict[str, int]] = None,
+        seat_keyboards: Optional[Union[Dict[str, int], Callable[[], Dict[str, int]]]] = None,
+        get_seat_keyboards: Optional[Callable[[], Dict[str, int]]] = None,
     ):
         """
         Args:
             on_trigger: Optional callback(seat_id, master_id, slave_id) when shortcut fires.
             on_device_changed: Optional callback() when devices are plugged or unplugged.
             launch_gui_if_needed: If True and no running GUI responds to IPC, launch the GUI process.
-            seat_keyboards: Optional map of seat_id -> master keyboard ID.
+            seat_keyboards: Optional map of seat_id -> master keyboard ID or dynamic provider callable.
+            get_seat_keyboards: Optional dynamic provider callable returning seat_id -> master keyboard ID.
         """
         self.on_trigger = on_trigger
         self.on_device_changed = on_device_changed
         self.launch_gui_if_needed = launch_gui_if_needed
-        self.seat_keyboards = seat_keyboards or {}
+
+        if callable(seat_keyboards):
+            self.get_seat_keyboards = seat_keyboards
+            self.seat_keyboards = {}
+        elif get_seat_keyboards is not None:
+            self.get_seat_keyboards = get_seat_keyboards
+            self.seat_keyboards = seat_keyboards or {}
+        else:
+            self.get_seat_keyboards = None
+            self.seat_keyboards = seat_keyboards or {}
 
         self._thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
@@ -511,7 +530,8 @@ class HotkeyManager:
 
     def _handle_shortcut_trigger(self, master_id: int, slave_id: int):
         """Called when Ctrl + Shift + M + S is hit on an input device."""
-        seat_id = resolve_seat_for_device(master_id, slave_id, seat_keyboards=self.seat_keyboards)
+        kbds_provider = self.get_seat_keyboards if self.get_seat_keyboards is not None else self.seat_keyboards
+        seat_id = resolve_seat_for_device(master_id, slave_id, seat_keyboards=kbds_provider)
         logger.info(
             f"Super Shortcut triggered! Master={master_id}, Slave={slave_id} -> Seat '{seat_id}'"
         )

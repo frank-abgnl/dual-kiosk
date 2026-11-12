@@ -181,7 +181,7 @@ def run(
 
         session_mgr.hotkey_mgr = HotkeyManager(
             on_trigger=on_hotkey,
-            seat_keyboards=session_mgr.engine.seat_keyboards,
+            seat_keyboards=lambda: session_mgr.engine.seat_keyboards,
         )
         session_mgr.hotkey_mgr.start()
 
