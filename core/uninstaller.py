@@ -30,14 +30,17 @@ MAIN_PY = PROJECT_ROOT / "main.py"
 CONFIG_DIR = Path.home() / ".config" / "xinput-seats"
 PROFILES_DIR = CONFIG_DIR / "profiles"
 
-DESKTOP_NAME = "xinput-multiseat.desktop"
+DESKTOP_NAMES = ("xinput-multiseat.desktop", "xinput-kiosk-launcher.desktop", "dual-kiosk.desktop")
 LAUNCHER_FILES = [
-    Path.home() / ".local" / "share" / "applications" / DESKTOP_NAME,
-    Path.home() / ".config" / "autostart" / DESKTOP_NAME,
-    Path.home() / "Desktop" / DESKTOP_NAME,
+    base / name
+    for base in (
+        Path.home() / ".local" / "share" / "applications",
+        Path.home() / ".config" / "autostart",
+        Path.home() / "Desktop",
+    )
+    for name in DESKTOP_NAMES
 ]
-SYSTEMD_UNIT = "xinput-multiseat.service"
-SYSTEMD_UNIT_FILE = Path.home() / ".config" / "systemd" / "user" / SYSTEMD_UNIT
+SYSTEMD_UNITS = ("dual-kiosk.service", "xinput-multiseat.service")
 
 
 def _run(args, timeout=5) -> Tuple[str, int]:
@@ -88,7 +91,7 @@ class Uninstaller:
                     continue
                 p = Path(a) if os.path.isabs(a) else Path(cwd) / a
                 try:
-                    if p.name in ("main.py", "launcher.py"):
+                    if p.resolve() in (PROJECT_ROOT / "main.py", PROJECT_ROOT / "launcher.py"):
                         found.append(pid)
                         break
                 except OSError:
@@ -183,10 +186,13 @@ class Uninstaller:
         else:
             self._remove(CONFIG_DIR)
 
-        if SYSTEMD_UNIT_FILE.exists() and not self.dry_run:
-            _run(["systemctl", "--user", "disable", "--now", SYSTEMD_UNIT])
-        self._remove(SYSTEMD_UNIT_FILE)
-        if SYSTEMD_UNIT_FILE.parent.exists() and not self.dry_run:
+        systemd_dir = Path.home() / ".config" / "systemd" / "user"
+        for unit in SYSTEMD_UNITS:
+            unit_file = systemd_dir / unit
+            if unit_file.exists() and not self.dry_run:
+                _run(["systemctl", "--user", "disable", "--now", unit])
+            self._remove(unit_file)
+        if systemd_dir.exists() and not self.dry_run:
             _run(["systemctl", "--user", "daemon-reload"])
 
         for f in LAUNCHER_FILES:

@@ -87,10 +87,13 @@ class ConfigManager:
             return self.get_default_config()
 
     def save_config(self, config_dict: Dict) -> bool:
-        """Saves configuration dict to JSON file."""
+        """Saves configuration dict atomically to JSON file."""
         try:
-            with open(self.config_path, "w", encoding="utf-8") as f:
+            import os
+            tmp_path = self.config_path.with_suffix(".json.tmp")
+            with open(tmp_path, "w", encoding="utf-8") as f:
                 json.dump(config_dict, f, indent=2)
+            os.replace(tmp_path, self.config_path)
             logger.info(f"Config successfully saved to {self.config_path}")
             return True
         except Exception as exc:

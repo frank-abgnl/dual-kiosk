@@ -652,13 +652,15 @@ class XInputSeatingEngine:
         if isinstance(master_ptr, int):
             self.confiner.release(master_ptr)
 
-        # 2. Float input devices
+        # 2. Float input devices and any sibling USB HID nodes
         if seat_config:
-            m_id = seat_config.get("mouse_id")
-            k_id = seat_config.get("keyboard_id")
-            for dev_id in (m_id, k_id):
+            from core.device_manager import DeviceManager
+            _, ptrs, kbds = DeviceManager().get_xinput_hierarchy()
+            for dev_id, pool in ((seat_config.get("mouse_id"), ptrs), (seat_config.get("keyboard_id"), kbds)):
                 if dev_id and isinstance(dev_id, int):
                     run_command(["xinput", "float", str(dev_id)])
+                    for sib in self._sibling_nodes(dev_id, pool):
+                        run_command(["xinput", "float", str(sib["id"])])
 
     def wake_seat(self, seat_config: Dict, displays_info: List[Dict], total_screen: Optional[Tuple[int, int]] = None):
         """

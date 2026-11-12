@@ -199,9 +199,13 @@ class KioskShield:
 
     def _restore_keymaps(self):
         disp = os.environ.get("DISPLAY") or ":0"
-        for dev, backup in list(self._backups.items()):
-            _run(["xkbcomp", "-i", str(dev), "-w", "0", str(backup), disp])
-        if self._backups:
+        restored = False
+        if KEYMAP_DIR.exists():
+            for backup in KEYMAP_DIR.glob("orig_*.xkb"):
+                dev = backup.stem.split("_", 1)[1]
+                _run(["xkbcomp", "-i", str(dev), "-w", "0", str(backup), disp])
+                restored = True
+        if restored or self._backups:
             logger.info("Original keymaps restored (Super key works again).")
         self._backups.clear()
 
