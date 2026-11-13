@@ -39,8 +39,17 @@ class ComboTracker:
         self.required = set(required)
         self.debounce = debounce
         self._pressed: Dict[int, Set[str]] = {}
-        self._held = False
+        self._held_devices: Set[int] = set()
         self._last = 0.0
+
+    @property
+    def _held(self) -> bool:
+        return bool(self._held_devices)
+
+    @_held.setter
+    def _held(self, val: bool):
+        if not val:
+            self._held_devices.clear()
 
     def event(self, device: int, group: Optional[str], pressed: bool, now: Optional[float] = None) -> bool:
         keys = self._pressed.setdefault(device, set())
@@ -48,14 +57,15 @@ class ComboTracker:
         if pressed:
             if group:
                 keys.add(group)
-            if self.required <= keys and not self._held and now - self._last > self.debounce:
-                self._held, self._last = True, now
+            if self.required <= keys and device not in self._held_devices and now - self._last > self.debounce:
+                self._held_devices.add(device)
+                self._last = now
                 return True
         else:
             if group:
                 keys.discard(group)
             if not self.required <= keys:
-                self._held = False
+                self._held_devices.discard(device)
         return False
 
 

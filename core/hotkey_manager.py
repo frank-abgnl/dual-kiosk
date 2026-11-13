@@ -283,6 +283,7 @@ class HotkeyManager:
 
     XI_RawKeyPress = 13
     XI_RawKeyRelease = 14
+    XI_RawButtonPress = 15
     XIAllMasterDevices = 1
     XIAllDevices = 0
 
@@ -293,6 +294,7 @@ class HotkeyManager:
         launch_gui_if_needed: bool = False,
         seat_keyboards: Optional[Union[Dict[str, int], Callable[[], Dict[str, int]]]] = None,
         get_seat_keyboards: Optional[Callable[[], Dict[str, int]]] = None,
+        on_activity: Optional[Callable[[str], None]] = None,
     ):
         """
         Args:
@@ -305,6 +307,8 @@ class HotkeyManager:
         self.on_trigger = on_trigger
         self.on_device_changed = on_device_changed
         self.launch_gui_if_needed = launch_gui_if_needed
+        self.on_activity = on_activity
+        self._last_activity_ts: Dict[int, float] = {}
 
         if callable(seat_keyboards):
             self.get_seat_keyboards = seat_keyboards
@@ -323,7 +327,7 @@ class HotkeyManager:
         self._pressed_keys: Dict[int, Set[str]] = {}
         self._last_trigger_time: float = 0.0
         self._debounce_window_sec: float = 0.8
-        self._combo_held: bool = False
+        self._combo_held_devices: Set[int] = set()
 
         # Key mapping caches
         self._ctrl_keycodes: Set[int] = {37, 105}
@@ -449,9 +453,13 @@ class HotkeyManager:
 
             self._resolve_dynamic_keycodes(x11, dpy)
 
-            # Mask 1: RawKeyPress (13) & RawKeyRelease (14) on XIAllMasterDevices (1)
+            # Mask 1: RawKeyPress (13), RawKeyRelease (14), RawButtonPress (15) on XIAllMasterDevices (1)
             mask1_bytes = (ctypes.c_ubyte * 3)()
-            mask1_bytes[1] |= (1 << (self.XI_RawKeyPress & 7)) | (1 << (self.XI_RawKeyRelease & 7))
+            mask1_bytes[1] |= (
+                (1 << (self.XI_RawKeyPress & 7))
+                | (1 << (self.XI_RawKeyRelease & 7))
+                | (1 << (self.XI_RawButtonPress & 7))
+            )
             m1 = _XIEventMask()
             m1.deviceid = self.XIAllMasterDevices
             m1.mask_len = 3
@@ -509,7 +517,22 @@ class HotkeyManager:
                         slave_id = raw.sourceid
                         keycode = raw.detail
 
-                        # Group by master device ID (and slave)
+                        # Throttled activity tracking (at most once per 5s per master device)
+                        if self.on_activity and evtype in (self.XI_RawKeyPress, self.XI_RawButtonPress):
+                            now_act = time.time()
+                            if now_act - self._last_activity_ts.get(master_id, 0.0) >= 5.0:
+                                self._last_activity_ts[master_id] = now_act
+                                try:
+                                    kbds_p = self.get_seat_keyboards if self.get_seat_keyboards is not None else self.seat_keyboards
+                                    act_seat = resolve_seat_for_device(master_id, slave_id, seat_keyboards=kbds_p)
+                                    self.on_activity(act_seat)
+                                except Exception:
+                                    pass
+
+                        if evtype == self.XI_RawButtonPress:
+                            continue
+
+                        # Group by master device ID
                         device_key = master_id
                         if device_key not in self._pressed_keys:
                             self._pressed_keys[device_key] = set()
@@ -524,17 +547,17 @@ class HotkeyManager:
                             current = self._pressed_keys[device_key]
                             if {"CTRL", "SHIFT", "M", "S"}.issubset(current):
                                 now = time.time()
-                                if (now - self._last_trigger_time > self._debounce_window_sec) and not self._combo_held:
+                                if (now - self._last_trigger_time > self._debounce_window_sec) and (device_key not in self._combo_held_devices):
                                     self._last_trigger_time = now
-                                    self._combo_held = True
+                                    self._combo_held_devices.add(device_key)
                                     self._handle_shortcut_trigger(master_id, slave_id)
 
                         elif evtype == self.XI_RawKeyRelease:
                             if group:
                                 self._pressed_keys[device_key].discard(group)
-                            # Release combo held state when any of the 4 keys is released
+                            # Release combo held state for this device when any of the 4 keys is released
                             if not {"CTRL", "SHIFT", "M", "S"}.issubset(self._pressed_keys[device_key]):
-                                self._combo_held = False
+                                self._combo_held_devices.discard(device_key)
 
                     finally:
                         x11.XFreeEventData(dpy, ctypes.byref(cookie))

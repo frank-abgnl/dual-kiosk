@@ -338,8 +338,15 @@ user_pref("app.update.enabled", false);
             return 0
 
     def _find_window_id_for_pid(self, pid: int, timeout_sec: int = 15) -> Optional[str]:
-        """Finds the main visible X11 window of the process (largest one wins)."""
+        """Finds the main visible X11 window of the process or its profile children (largest one wins)."""
         start = time.time()
+        prof_str = None
+        for sid, proc in list(self.running_processes.items()):
+            if getattr(proc, "pid", None) == pid:
+                pname = self.kiosk_configs.get(sid, {}).get("profile_name", sid)
+                prof_str = str(self.get_profile_path(sid, profile_name=pname))
+                break
+
         while time.time() - start < timeout_sec:
             out, _, rc = run_command(["xdotool", "search", "--onlyvisible", "--pid", str(pid)])
             if rc == 0 and out:
@@ -352,8 +359,16 @@ user_pref("app.update.enabled", false);
             if rc2 == 0 and out2:
                 for line in out2.splitlines():
                     parts = line.split()
-                    if len(parts) >= 3 and parts[2] == str(pid):
-                        return parts[0]
+                    if len(parts) >= 3:
+                        if parts[2] == str(pid):
+                            return parts[0]
+                        if prof_str and parts[2].isdigit():
+                            try:
+                                cmdline = Path(f"/proc/{parts[2]}/cmdline").read_bytes().decode("utf-8", errors="ignore").replace("\x00", " ")
+                                if "firefox" in cmdline.lower() and prof_str in cmdline:
+                                    return parts[0]
+                            except Exception:
+                                pass
 
             time.sleep(0.4)
         return None
@@ -758,10 +773,25 @@ user_pref("app.update.enabled", false);
         """
         Discovers active Firefox kiosk processes and windows on the system,
         populating window_ids even if this KioskManager didn't spawn them.
+        Matches both custom configured profile_name and default seat1/seat2 profile paths.
         """
         out, _, rc = run_command(["wmctrl", "-l", "-p"])
         if rc != 0 or not out:
             return {}
+
+        profile_to_seat = {"profiles/seat1": "seat1", "profiles/seat2": "seat2"}
+        try:
+            from core.config_manager import ConfigManager
+            for s in ConfigManager().load_config().get("seats", []):
+                sid = s.get("id")
+                pname = s.get("profile_name") or sid
+                if sid and pname:
+                    profile_to_seat[f"profiles/{pname}"] = sid
+        except Exception:
+            pass
+        for sid, cfg in self.kiosk_configs.items():
+            pname = cfg.get("profile_name") or sid
+            profile_to_seat[f"profiles/{pname}"] = sid
 
         discovered = {}
         for line in out.splitlines():
@@ -777,13 +807,12 @@ user_pref("app.update.enabled", false);
                 if cmdline_path.exists():
                     try:
                         cmdline = cmdline_path.read_bytes().decode("utf-8", errors="ignore").replace("\x00", " ")
-                        if "firefox" in cmdline:
-                            if "profiles/seat1" in cmdline:
-                                self.window_ids["seat1"] = win_id
-                                discovered["seat1"] = {"pid": pid, "window_id": win_id, "running": True}
-                            elif "profiles/seat2" in cmdline:
-                                self.window_ids["seat2"] = win_id
-                                discovered["seat2"] = {"pid": pid, "window_id": win_id, "running": True}
+                        if "firefox" in cmdline.lower():
+                            for marker, seat_id in profile_to_seat.items():
+                                if marker in cmdline:
+                                    self.window_ids[seat_id] = win_id
+                                    discovered[seat_id] = {"pid": pid, "window_id": win_id, "running": True}
+                                    break
                     except Exception:
                         pass
         return discovered

@@ -75,7 +75,8 @@ class DeviceManager:
             from core.display_guard import ensure_extended
             from core.config_manager import ConfigManager
             import time
-            saved = ConfigManager().load_config().get("settings", {}).get("display_layout", {})
+            cfg_loaded = ConfigManager().load_config()
+            saved = cfg_loaded.get("display_layout") or cfg_loaded.get("settings", {}).get("display_layout", {})
             acts = ensure_extended(displays, saved)
             if acts:
                 time.sleep(0.3)

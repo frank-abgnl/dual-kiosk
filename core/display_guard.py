@@ -198,7 +198,7 @@ class DisplayGuard:
         if not st.get("display_sleep_mode", True):
             return
         auto_ext = st.get("auto_extended_display", True)
-        saved = st.get("display_layout", {})
+        saved = cfg.get("display_layout") or st.get("display_layout", {})
         seats = cfg.get("seats", [])[:2]
 
         displays, _ = self.dm.get_displays()
@@ -297,13 +297,20 @@ class DisplayGuard:
 
         # If original display name not found, automatically assign the newly detected display!
         if d is None and len(displays) >= 2:
-            cfg = self.cfg_mgr.load_config()
-            all_seats = cfg.get("seats", [])
-            updated_seats, msgs = self.dm.assign_displays_to_seats(all_seats, displays)
-            for m in msgs:
+            msgs_holder: List[str] = []
+            updated_holder: List[Dict] = []
+
+            def _mutate_wake(cfg_d: Dict):
+                all_seats = cfg_d.get("seats", [])
+                updated_s, m_list = self.dm.assign_displays_to_seats(all_seats, displays)
+                cfg_d["seats"] = updated_s
+                msgs_holder.extend(m_list)
+                updated_holder.extend(updated_s)
+
+            self.cfg_mgr.update(_mutate_wake)
+            for m in msgs_holder:
                 self._emit(f"🖥 {m}")
-            cfg["seats"] = updated_seats
-            self.cfg_mgr.save_config(cfg)
+            updated_seats = updated_holder
 
             cur_s = next((s for s in updated_seats if s.get("id") == sid), None)
             if cur_s:
@@ -393,7 +400,7 @@ class DisplayGuard:
                     self.kiosk.lock_window(win)
 
     def _remember_layout(self, seats: List[Dict], displays: List[Dict], by_name: Dict[str, Dict]):
-        """Stores the healthy extended layout so a reconnected monitor returns to its place."""
+        """Stores the healthy extended layout in runtime state so a reconnected monitor returns to its place."""
         if is_mirrored(displays):
             return
         for seat in seats:
@@ -402,7 +409,6 @@ class DisplayGuard:
                 return
         layout = {d["name"]: {"x": d["x"], "y": d["y"], "width": d["width"], "height": d["height"]}
                   for d in displays if d.get("width", 0) > 0}
-        cfg = self.cfg_mgr.load_config()
-        if cfg.get("settings", {}).get("display_layout") != layout:
-            cfg.setdefault("settings", {})["display_layout"] = layout
-            self.cfg_mgr.save_config(cfg)
+        rt = self.cfg_mgr.load_runtime()
+        if rt.get("display_layout") != layout:
+            self.cfg_mgr.update_runtime(lambda r: r.__setitem__("display_layout", layout))

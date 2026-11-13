@@ -238,10 +238,11 @@ class SessionManager:
             _emit(f"Terminating all active kiosk browsers: {kiosk_pids}...")
             self.uninstaller._terminate(kiosk_pids, "kiosk browsers")
 
-        # Double check with pkill -f for isolated profile dirs
+        # Double check for any surviving Firefox kiosk processes (strictly matching firefox binary)
         try:
-            prof_dir = str(PROFILES_DIR)
-            subprocess.run(["pkill", "-9", "-f", prof_dir], capture_output=True)
+            surviving = self.uninstaller.find_kiosks()
+            if surviving:
+                self.uninstaller._terminate(surviving, "surviving kiosk browsers", timeout=2.0)
         except Exception:
             pass
 

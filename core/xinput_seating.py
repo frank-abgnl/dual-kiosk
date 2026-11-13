@@ -268,16 +268,18 @@ class XInputSeatingEngine:
             return PROMOTE_AFTER_SEC
 
     def _persist_lock(self, seat_id: str, cls: str, name: str, ident: Dict):
-        """Writes a (new) locked device into config.json."""
+        """Writes a (new) locked device into config.json atomically."""
         try:
             from core.config_manager import ConfigManager
             cm = ConfigManager()
-            cfg = cm.load_config()
-            name_k, _, ident_k = KEYS[cls]
-            for seat in cfg.get("seats", []):
-                if seat.get("id") == seat_id:
-                    seat[name_k], seat[ident_k] = name, ident
-            cm.save_config(cfg)
+            name_k, _, ident_k, _ = KEYS[cls]
+
+            def _mutate(cfg: Dict):
+                for seat in cfg.get("seats", []):
+                    if seat.get("id") == seat_id:
+                        seat[name_k], seat[ident_k] = name, ident
+
+            cm.update(_mutate)
         except Exception as exc:
             logger.warning(f"Could not persist locked device for {seat_id}: {exc}")
 
@@ -542,8 +544,16 @@ class XInputSeatingEngine:
         """
         if not self.owns_seating:
             return []
-        if time.time() < self.manual_hold_until:
+        now_check = time.time()
+        if now_check < self.manual_hold_until:
             return []
+        try:
+            from core.config_manager import ConfigManager
+            rt_hold = float(ConfigManager().load_runtime().get("manual_hold_until", 0.0))
+            if now_check < rt_hold:
+                return []
+        except Exception:
+            pass
         if not self._hotplug_lock.acquire(blocking=False):
             return []
         try:

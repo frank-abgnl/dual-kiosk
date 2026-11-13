@@ -417,7 +417,12 @@ class DevicesTab(Gtk.Box):
 
         def _action():
             self.app.seating_engine.reattach_device(dev_id, 2)
-            self.app.seating_engine.manual_hold_until = time.time() + 60
+            hold_ts = time.time() + 60
+            self.app.seating_engine.manual_hold_until = hold_ts
+            try:
+                self.app.config_mgr.update_runtime(lambda r: r.__setitem__("manual_hold_until", hold_ts))
+            except Exception:
+                pass
 
         def _done(_res, err):
             if err:
@@ -443,7 +448,12 @@ class DevicesTab(Gtk.Box):
                     self.app.seating_engine.seat_pointers[seat_id] = ptr_id
             if ptr_id:
                 self.app.seating_engine.reattach_device(dev_id, ptr_id)
-                self.app.seating_engine.manual_hold_until = time.time() + 60
+                hold_ts = time.time() + 60
+            self.app.seating_engine.manual_hold_until = hold_ts
+            try:
+                self.app.config_mgr.update_runtime(lambda r: r.__setitem__("manual_hold_until", hold_ts))
+            except Exception:
+                pass
                 return ptr_id
             raise RuntimeError(f"Could not create master pair for {seat_id}")
 
@@ -464,7 +474,12 @@ class DevicesTab(Gtk.Box):
 
         def _action():
             self.app.seating_engine.reattach_device(dev_id, 3)
-            self.app.seating_engine.manual_hold_until = time.time() + 60
+            hold_ts = time.time() + 60
+            self.app.seating_engine.manual_hold_until = hold_ts
+            try:
+                self.app.config_mgr.update_runtime(lambda r: r.__setitem__("manual_hold_until", hold_ts))
+            except Exception:
+                pass
 
         def _done(_res, err):
             if err:
@@ -490,7 +505,12 @@ class DevicesTab(Gtk.Box):
                     self.app.seating_engine.seat_keyboards[seat_id] = kbd_id
             if kbd_id:
                 self.app.seating_engine.reattach_device(dev_id, kbd_id)
-                self.app.seating_engine.manual_hold_until = time.time() + 60
+                hold_ts = time.time() + 60
+            self.app.seating_engine.manual_hold_until = hold_ts
+            try:
+                self.app.config_mgr.update_runtime(lambda r: r.__setitem__("manual_hold_until", hold_ts))
+            except Exception:
+                pass
                 return kbd_id
             raise RuntimeError(f"Could not create master pair for {seat_id}")
 

@@ -150,18 +150,37 @@ class TestTab(Gtk.Box):
             self.proc_store.append(r)
 
     def _restart_single(self, seat_id: str):
+        import os, signal
         cfg = self.app.config_mgr.load_config()
         seats = cfg.get("seats", [])
         seat_cfg = next((s for s in seats if s.get("id") == seat_id), {})
         url = seat_cfg.get("kiosk_url", "https://duckduckgo.com")
+        prof_name = seat_cfg.get("profile_name", seat_id)
+        enforce_lock = seat_cfg.get("lock_kiosk", True)
         mon_idx = 0 if seat_id == "seat1" else 1
 
-        displays, _ = self.app.device_mgr.get_displays()
-        geom = None
-        if displays and len(displays) > mon_idx:
-            d = displays[mon_idx]
-            geom = (d["width"], d["height"], d["x"], d["y"])
+        # If another process (supervisor) spawned this seat's Firefox, terminate that PID first
+        # so the supervisor watchdog respawns it cleanly (or we relaunch without profile lock conflict).
+        discovered = self.app.kiosk_mgr.discover_running_kiosks()
+        ext_pid = discovered.get(seat_id, {}).get("pid")
+        from core.session_manager import get_supervisor_pid
+        sup_pid = get_supervisor_pid()
+        if ext_pid and sup_pid and sup_pid != os.getpid():
+            try:
+                os.kill(ext_pid, signal.SIGTERM)
+                self.app.dashboard_tab.append_log(f"Signaled supervisor to respawn {seat_id} kiosk (PID {ext_pid}).")
+                GLib.timeout_add(1500, self.refresh)
+                return
+            except OSError:
+                pass
 
-        self.app.kiosk_mgr.launch_kiosk(seat_id, url, monitor_index=mon_idx, display_geometry=geom, enforce_lock=True)
+        displays, _ = self.app.device_mgr.get_displays()
+        geoms = self.app.kiosk_mgr._geometry_for_seats(displays)
+        geom = geoms[mon_idx] if mon_idx < len(geoms) else None
+
+        self.app.kiosk_mgr.launch_kiosk(
+            seat_id, url, monitor_index=mon_idx, display_geometry=geom,
+            enforce_lock=enforce_lock, profile_name=prof_name,
+        )
         self.app.dashboard_tab.append_log(f"Restarted {seat_id} kiosk.")
         self.refresh()

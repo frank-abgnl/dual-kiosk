@@ -164,15 +164,10 @@ X-GNOME-Autostart-enabled=true
             logger.warning(f"Failed to write XDG autostart desktop file: {exc}")
             return False
 
-    # 4. Save state to config
+    # 4. Save state to config atomically under lock
     try:
         from core.config_manager import ConfigManager
-        cfg_mgr = ConfigManager()
-        cfg = cfg_mgr.load_config()
-        if "settings" not in cfg:
-            cfg["settings"] = {}
-        cfg["settings"]["auto_start_kiosks"] = True
-        cfg_mgr.save_config(cfg)
+        ConfigManager().update(lambda c: c.setdefault("settings", {}).__setitem__("auto_start_kiosks", True))
     except Exception as exc:
         logger.warning(f"Could not update config file for autostart: {exc}")
 
@@ -205,15 +200,10 @@ def disable_autostart() -> bool:
 
     run_command(["systemctl", "--user", "daemon-reload"])
 
-    # Update config setting
+    # Update config setting atomically under lock
     try:
         from core.config_manager import ConfigManager
-        cfg_mgr = ConfigManager()
-        cfg = cfg_mgr.load_config()
-        if "settings" not in cfg:
-            cfg["settings"] = {}
-        cfg["settings"]["auto_start_kiosks"] = False
-        cfg_mgr.save_config(cfg)
+        ConfigManager().update(lambda c: c.setdefault("settings", {}).__setitem__("auto_start_kiosks", False))
     except Exception as exc:
         logger.warning(f"Could not update config file for autostart: {exc}")
 
