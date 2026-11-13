@@ -11,6 +11,7 @@ from gi.repository import Gtk, Gdk, GLib, GdkX11
 import logging
 import os
 import subprocess
+import sys
 import threading
 from pathlib import Path
 from typing import Optional
@@ -148,7 +149,10 @@ class XInputMultiseatApp(Gtk.ApplicationWindow):
         self.hotkey_mgr = None
 
         self.ipc_server = OverlayIPCServer(on_command=self._on_ipc_command)
-        self.ipc_server.start()
+        if not self.ipc_server.start():
+            logger.warning("Another Control Board GUI instance is already running.")
+            if "pytest" not in sys.modules:
+                sys.exit(0)
 
         # Periodic hotplug monitoring in GUI only when running standalone with no supervisor
         if not get_supervisor_pid():

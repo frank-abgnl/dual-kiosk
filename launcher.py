@@ -66,6 +66,7 @@ def _read_pid():
 def spawn_control_board(seat: str, start_hidden: bool = False):
     env = os.environ.copy()
     env.pop("WAYLAND_DISPLAY", None)
+    env["GDK_BACKEND"] = "x11"
     cmd = [sys.executable, str(PROJECT_DIR / "main.py"), "--seat", seat]
     if not start_hidden:
         cmd.append("--overlay")

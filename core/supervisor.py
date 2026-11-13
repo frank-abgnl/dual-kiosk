@@ -68,6 +68,7 @@ def spawn_control_board(seat: str = "seat1", start_hidden: bool = False):
     """Spawns the GTK3 Control Board GUI."""
     env = os.environ.copy()
     env.pop("WAYLAND_DISPLAY", None)
+    env["GDK_BACKEND"] = "x11"
     cmd = [sys.executable, str(MAIN_PY), "--seat", seat]
     if not start_hidden:
         cmd.append("--overlay")

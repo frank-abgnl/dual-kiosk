@@ -82,12 +82,24 @@ class OverlayIPCServer:
         self._thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
 
-    def start(self):
+    def start(self) -> bool:
         SOCKET_PATH.parent.mkdir(parents=True, exist_ok=True)
-        try:
-            SOCKET_PATH.unlink(missing_ok=True)
-        except Exception:
-            pass
+        if SOCKET_PATH.exists():
+            try:
+                with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as probe:
+                    probe.settimeout(0.5)
+                    probe.connect(str(SOCKET_PATH))
+                    probe.sendall(b"PING\n")
+                    resp = probe.recv(64).decode("utf-8", errors="ignore").strip()
+                    if resp in ("PONG", "OK"):
+                        logger.warning(f"Overlay IPC socket at {SOCKET_PATH} is already active; another GUI is running.")
+                        return False
+            except Exception:
+                # Stale socket, unlink
+                try:
+                    SOCKET_PATH.unlink(missing_ok=True)
+                except Exception:
+                    pass
 
         try:
             self._sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -97,12 +109,13 @@ class OverlayIPCServer:
         except Exception as exc:
             logger.error(f"Failed to bind overlay IPC socket at {SOCKET_PATH}: {exc}")
             self._sock = None
-            return
+            return False
 
         self._stop_event.clear()
         self._thread = threading.Thread(target=self._server_loop, daemon=True, name="OverlayIPCServer")
         self._thread.start()
         logger.info(f"Overlay IPC server listening on {SOCKET_PATH}")
+        return True
 
     def stop(self):
         self._stop_event.set()
@@ -136,12 +149,15 @@ class OverlayIPCServer:
                     data = conn.recv(1024).decode("utf-8", errors="ignore").strip()
                     if data:
                         logger.info(f"IPC server received command: {data}")
-                        try:
-                            self.on_command(data)
-                            conn.sendall(b"OK\n")
-                        except Exception as exc:
-                            logger.error(f"Error handling IPC command '{data}': {exc}")
-                            conn.sendall(b"ERR\n")
+                        if data == "PING":
+                            conn.sendall(b"PONG\n")
+                        else:
+                            try:
+                                self.on_command(data)
+                                conn.sendall(b"OK\n")
+                            except Exception as exc:
+                                logger.error(f"Error handling IPC command '{data}': {exc}")
+                                conn.sendall(b"ERR\n")
             except (BlockingIOError, socket.error):
                 continue
             except Exception as exc:

@@ -244,6 +244,13 @@ def main():
         return
 
     # Default: Run GTK3 GUI
+    # If a Control Board GUI is already running, activate it and exit immediately
+    from core.hotkey_manager import send_overlay_command
+    target = args.seat or "seat1"
+    if send_overlay_command(f"SHOW {target}"):
+        print(f"[✓] Control Board GUI is already running. Brought window to front on {target}.")
+        return
+
     from core.preflight import preflight
     pref = preflight()
     for w in pref.warnings:
@@ -255,17 +262,35 @@ def main():
     try:
         import gi
         gi.require_version('Gtk', '3.0')
-        from gi.repository import Gtk, GLib
+        from gi.repository import Gtk, GLib, Gio
         from gui.app import XInputMultiseatApp
 
-        app = XInputMultiseatApp(overlay_mode=args.overlay, target_seat=args.seat or "seat1")
+        class MultiseatApplication(Gtk.Application):
+            def __init__(self):
+                super().__init__(
+                    application_id="org.xinput.multiseat",
+                    flags=Gio.ApplicationFlags.FLAGS_NONE,
+                )
+                self.win = None
+
+            def do_activate(self):
+                if not self.win:
+                    self.win = XInputMultiseatApp(
+                        overlay_mode=args.overlay,
+                        target_seat=args.seat or "seat1",
+                        application=self,
+                    )
+                    self.win.show_all()
+                else:
+                    self.win.present()
+
+        gtk_app = MultiseatApplication()
         for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
             try:
-                signal.signal(sig, lambda *_: GLib.idle_add(app.destroy))
+                signal.signal(sig, lambda *_: GLib.idle_add(gtk_app.quit))
             except Exception:
                 pass
-        app.show_all()
-        Gtk.main()
+        sys.exit(gtk_app.run([sys.argv[0]]))
     except Exception as exc:
         logger.error(f"Failed to launch GTK GUI: {exc}")
         print("\nNote: Running in headless CLI mode fallback (--status):")

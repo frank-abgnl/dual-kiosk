@@ -1,7 +1,9 @@
+import socket
 import pytest
 from unittest.mock import MagicMock, patch
 from core.xinput_seating import XInputSeatingEngine
 from core.supervisor import check_spawn_guard
+from core.hotkey_manager import OverlayIPCServer
 
 
 def test_reset_all_to_core_only_removes_seat_masters():
@@ -82,3 +84,35 @@ def test_spawn_guard_cooldown(tmp_path):
         assert mock_sleep.called
         wait_arg = mock_sleep.call_args[0][0]
         assert 8.0 <= wait_arg <= 10.0
+
+
+def test_overlay_ipc_server_ping_pong_and_no_steal(tmp_path):
+    sock_path = tmp_path / "overlay.sock"
+    with patch("core.hotkey_manager.SOCKET_PATH", sock_path):
+        server1 = OverlayIPCServer(on_command=lambda cmd: None)
+        assert server1.start() is True
+
+        # Send PING, expect PONG
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+            client.settimeout(1.0)
+            client.connect(str(sock_path))
+            client.sendall(b"PING\n")
+            resp = client.recv(64).decode("utf-8").strip()
+            assert resp == "PONG"
+
+        # Attempt to start server2 on active socket: must detect active server and return False
+        server2 = OverlayIPCServer(on_command=lambda cmd: None)
+        assert server2.start() is False
+        assert sock_path.exists()
+
+        server1.stop()
+
+
+def test_second_gui_launch_exits_immediately():
+    import main
+    # When send_overlay_command succeeds (e.g. active GUI exists), main() returns immediately without starting Gtk
+    with patch("core.hotkey_manager.send_overlay_command", return_value=True), \
+         patch("sys.argv", ["main.py"]):
+        # Should not raise and return None
+        res = main.main()
+        assert res is None
