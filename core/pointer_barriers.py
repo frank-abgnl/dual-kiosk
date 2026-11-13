@@ -36,6 +36,28 @@ def is_point_in_rect(px: float, py: float, rect: Tuple[int, int, int, int]) -> b
     return (rx <= px < rx + rw) and (ry <= py < ry + rh)
 
 
+def compute_barrier_edges(
+    x: int, y: int, w: int, h: int, total_screen: Optional[Tuple[int, int]] = None
+) -> List[Tuple[int, int, int, int, int]]:
+    """
+    Computes barrier coordinates and allowed directions for a monitor rectangle.
+    Barriers are only created for interior boundaries (adjacent to other screens);
+    outer edges that touch the screen canvas boundary require no barriers.
+    Returns list of (x1, y1, x2, y2, allowed_direction).
+    """
+    tw, th = total_screen or (0, 0)
+    edges = []
+    if x > 0:
+        edges.append((x, y, x, y + h, POSITIVE_X))            # left edge: allow entering from left
+    if tw == 0 or x + w < tw:
+        edges.append((x + w, y, x + w, y + h, NEGATIVE_X))    # right edge: allow entering from right
+    if y > 0:
+        edges.append((x, y, x + w, y, POSITIVE_Y))            # top edge: allow entering from top
+    if th == 0 or y + h < th:
+        edges.append((x, y + h, x + w, y + h, NEGATIVE_Y))    # bottom edge: allow entering from bottom
+    return edges
+
+
 def nearest_point_in_rect(px: float, py: float, rect: Tuple[int, int, int, int]) -> Tuple[float, float]:
     """
     Clamps (px, py) to the nearest point inside rect=(x, y, w, h).
@@ -278,16 +300,7 @@ class PointerConfiner:
             self._xi.XIWarpPointer(self._dpy, master_id, 0, self._root,
                                    0.0, 0.0, 0, 0, float(x + w // 2), float(y + h // 2))
 
-            tw, th = total_screen or (0, 0)
-            edges = []
-            if x > 0:
-                edges.append((x, y, x, y + h, POSITIVE_X))            # left edge: allow entering
-            if tw == 0 or x + w < tw:
-                edges.append((x + w, y, x + w, y + h, NEGATIVE_X))    # right edge
-            if y > 0:
-                edges.append((x, y, x + w, y, POSITIVE_Y))            # top edge
-            if th == 0 or y + h < th:
-                edges.append((x, y + h, x + w, y + h, NEGATIVE_Y))    # bottom edge
+            edges = compute_barrier_edges(x, y, w, h, total_screen)
 
             devs = (ctypes.c_int * 1)(master_id)
             created = []
