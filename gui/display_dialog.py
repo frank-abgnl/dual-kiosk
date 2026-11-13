@@ -356,22 +356,6 @@ class DisplayDialog(Gtk.Window):
         overlay_state.clear("dialog")
 
 
-def run_single_display_error_modal(active_displays: List[Dict]) -> Tuple[bool, Optional[List[Dict]]]:
-    """
-    Shows modal error dialog when only one display is detected at launch.
-    Blocks until user clicks Retry (and 2 displays are found) or Cancel.
-    Returns (True, new_active_displays) on success, or (False, None) if cancelled.
-    """
-    disp_name = active_displays[0]["name"] if active_displays else "Unknown"
-    dlg = DisplayDialog(mode="error", active_display=disp_name)
-    dlg.present()
-    dlg.show_all()
-    Gtk.main()
-
-    if dlg.success_displays and len(dlg.success_displays) >= 2:
-        return True, dlg.success_displays
-    return False, None
-
 
 def main():
     parser = argparse.ArgumentParser(description="Display Error / Warning Dialog with Retry")
