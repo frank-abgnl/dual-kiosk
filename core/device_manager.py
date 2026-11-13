@@ -99,6 +99,7 @@ class DeviceManager:
         messages = []
         disp_names = [d["name"] for d in active]
         assigned_displays = set()
+        assigned_seats = set()
         updated_seats = [dict(s) for s in seats]
 
         # Phase 1: Preference for locked_display match
@@ -108,15 +109,19 @@ class DeviceManager:
             if pref and pref in disp_names and pref not in assigned_displays:
                 s["display"] = pref
                 assigned_displays.add(pref)
+                assigned_seats.add(sid)
                 messages.append(f"{sid}: Retained preferred locked display '{pref}'")
 
         # Phase 2: Preserve current seat['display'] if active and unassigned
         for s in updated_seats:
             sid = s.get("id", "seat")
+            if sid in assigned_seats:
+                continue
             cur = s.get("display")
             if cur and cur in disp_names and cur not in assigned_displays:
                 s["display"] = cur
                 assigned_displays.add(cur)
+                assigned_seats.add(sid)
 
         # Phase 3: Fill unassigned seats from remaining connected displays
         rem_displays = [d for d in active if d["name"] not in assigned_displays]
@@ -124,15 +129,20 @@ class DeviceManager:
 
         for s in updated_seats:
             sid = s.get("id", "seat")
-            if s.get("display") not in disp_names or s.get("display") in (assigned_displays - {s.get("display")}):
+            if sid not in assigned_seats:
                 if rem_displays:
                     chosen = rem_displays.pop(0)
                     old_disp = s.get("display")
                     s["display"] = chosen["name"]
                     assigned_displays.add(chosen["name"])
+                    assigned_seats.add(sid)
                     messages.append(f"{sid}: Automatically assigned newly detected display '{chosen['name']}' (was '{old_disp}')")
                     if not s.get("locked_display"):
                         s["locked_display"] = chosen["name"]
+                else:
+                    # No display available for this seat; clear duplicate/disconnected display
+                    s["display"] = None
+                    messages.append(f"{sid}: No display available to assign.")
 
         return updated_seats, messages
 
