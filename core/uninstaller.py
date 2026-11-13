@@ -27,8 +27,7 @@ logger = logging.getLogger("xinput_seating.uninstall")
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 MAIN_PY = PROJECT_ROOT / "main.py"
-CONFIG_DIR = Path.home() / ".config" / "xinput-seats"
-PROFILES_DIR = CONFIG_DIR / "profiles"
+from core.paths import CONFIG_DIR, PROFILES_DIR, STATE_DIR
 
 DESKTOP_NAMES = ("xinput-multiseat.desktop", "xinput-kiosk-launcher.desktop", "dual-kiosk.desktop")
 LAUNCHER_FILES = [
@@ -107,7 +106,7 @@ class Uninstaller:
             if pid != me and "firefox" in " ".join(argv).lower() and prof in " ".join(argv)
         ]
 
-    def _terminate(self, pids: List[int], label: str):
+    def _terminate(self, pids: List[int], label: str, timeout: float = 12.0):
         if not pids:
             self._say(f"    No {label} running.")
             return
@@ -119,7 +118,7 @@ class Uninstaller:
                 os.kill(pid, signal.SIGTERM)
             except OSError:
                 pass
-        deadline = time.time() + 4
+        deadline = time.time() + timeout
         while time.time() < deadline:
             if not any(self._alive(p) for p in pids):
                 return
@@ -150,17 +149,6 @@ class Uninstaller:
             self._say("    Would reattach all devices to Virtual core and remove custom masters.")
             return
         XInputSeatingEngine().reset_all_to_core()
-
-        # Pick up any devices left floating after master removal.
-        out, rc = _run(["xinput", "list"])
-        if rc == 0:
-            for line in out.splitlines():
-                if "[floating slave]" not in line or "XTEST" in line:
-                    continue
-                dev_id = line.split("id=")[1].split()[0]
-                # Class is unknown from the listing; wrong-class attempt fails harmlessly.
-                for master in (XInputSeatingEngine.CORE_POINTER_ID, XInputSeatingEngine.CORE_KEYBOARD_ID):
-                    _run(["xinput", "reattach", dev_id, str(master)])
         self._say("    XInput devices restored to Virtual core.")
 
     # ------------------------------------------------------------------
@@ -185,6 +173,7 @@ class Uninstaller:
             self._say(f"    Keeping {CONFIG_DIR} (--keep-config).")
         else:
             self._remove(CONFIG_DIR)
+            self._remove(STATE_DIR)
 
         systemd_dir = Path.home() / ".config" / "systemd" / "user"
         for unit in SYSTEMD_UNITS:
@@ -208,16 +197,21 @@ class Uninstaller:
     # ------------------------------------------------------------------
     def run(self) -> bool:
         tag = " (dry run)" if self.dry_run else ""
-        self._say(f"[1/4] Stopping supervisors{tag}...")
+        self._say(f"[1/5] Restoring original keymaps{tag}...")
+        from core.kiosk_shield import restore_all_keymaps
+        if not self.dry_run:
+            restore_all_keymaps()
+
+        self._say(f"[2/5] Stopping supervisors{tag}...")
         self._terminate(self.find_supervisors(), "supervisor/GUI processes")
 
-        self._say(f"[2/4] Stopping Firefox kiosks{tag}...")
+        self._say(f"[3/5] Stopping Firefox kiosks{tag}...")
         self._terminate(self.find_kiosks(), "kiosk browsers")
 
-        self._say(f"[3/4] Resetting XInput seating{tag}...")
+        self._say(f"[4/5] Resetting XInput seating{tag}...")
         self.reset_xinput()
 
-        self._say(f"[4/4] Removing configuration and launchers{tag}...")
+        self._say(f"[5/5] Removing configuration and launchers{tag}...")
         self.remove_files()
 
         self._say("[✓] Uninstall complete. System is back to its pre-setup state." if not self.dry_run

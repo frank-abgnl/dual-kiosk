@@ -16,7 +16,9 @@ import time
 from pathlib import Path
 from typing import Dict, List, Optional
 
-STATE_FILE = Path.home() / ".config" / "xinput-seats" / "overlay_state.json"
+from core.paths import STATE_DIR
+
+STATE_FILE = STATE_DIR / "overlay_state.json"
 TTL_SEC = 6.0
 _lock = threading.Lock()
 

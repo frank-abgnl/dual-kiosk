@@ -10,16 +10,17 @@ import sys
 import os
 import argparse
 import logging
+import signal
+
+# Enforce X11 backend for GDK on Wayland desktops
+os.environ.setdefault("GDK_BACKEND", "x11")
 
 # Ensure project root is in sys.path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 # Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    datefmt="%H:%M:%S",
-)
+from core.logging_setup import setup_logging
+setup_logging()
 logger = logging.getLogger("xinput_seating")
 
 
@@ -67,7 +68,10 @@ def run_cli(args):
     if args.auto_start:
         # Automated boot / power outage recovery sequence
         print("[*] Running automatic boot & reseating sequence...")
-        run_startup_reseat_and_launch()
+        from launcher import launch
+        rc = launch(args)
+        if rc != 0:
+            sys.exit(1)
         return
 
     if args.enable_autostart:
@@ -158,29 +162,11 @@ def run_cli(args):
         return
 
     if args.start:
-        ok, msg = session_mgr.start_session(on_event=lambda m: print(f"[*] {m}"))
-        if ok:
-            print("[✓] Dual Firefox kiosks launched successfully!")
-            from core.hotkey_manager import HotkeyManager
-            session_mgr.hotkey_mgr = HotkeyManager(launch_gui_if_needed=True, seat_keyboards=engine.seat_keyboards)
-            session_mgr.hotkey_mgr.start()
-            print("    ⌨ Super Shortcut: Press Ctrl+Shift+M+S on any seat to overlay the control board.")
-            print("    Press Ctrl+C to stop kiosks and reset seating.")
-            try:
-                import time
-                while True:
-                    time.sleep(2)
-                    seats = cfg_mgr.load_config().get("seats", [])
-                    reseated = engine.check_and_reseat_hotplugged_devices(seats)
-                    if reseated:
-                        for m in reseated:
-                            print(f"[✓] Hotplug: {m}")
-            except KeyboardInterrupt:
-                print("\n[*] Stopping kiosks, display guard, hotkey listener and resetting devices...")
-                session_mgr.stop_session(exit_gui=True, on_event=lambda m: print(f"[*] {m}"))
-                print("[✓] Cleanup complete.")
-        else:
-            print(f"[✗] {msg}")
+        print("[*] Starting dual-seat kiosk supervisor...")
+        from launcher import launch
+        rc = launch(args)
+        if rc != 0:
+            sys.exit(1)
         return
 
 
@@ -202,6 +188,7 @@ def main():
     parser.add_argument("--overlay", action="store_true", help="Launch Control Board GUI in overlay mode on top of kiosk mode")
     parser.add_argument("--seat", default="seat1", help="Target seat for overlay mode (default: seat1)")
     parser.add_argument("--toggle-overlay", action="store_true", help="Toggle Control Board overlay on target seat via IPC or launch")
+    parser.add_argument("--restore-keymaps", action="store_true", help="Restore original XKB keymaps (re-enables Super key) and exit")
     parser.add_argument("--uninstall", action="store_true",
                         help="Terminate everything, reset XInput, and remove configs/profiles/launchers")
     parser.add_argument("--yes", "-y", action="store_true", help="Skip the confirmation prompt (with --uninstall)")
@@ -210,6 +197,14 @@ def main():
     parser.add_argument("--dry-run", action="store_true", help="Show what --uninstall would do without changing anything")
 
     args = parser.parse_args()
+
+    # Restore keymaps option
+    if args.restore_keymaps:
+        from core.kiosk_shield import restore_all_keymaps
+        print("[*] Restoring original XKB keymaps...")
+        restore_all_keymaps()
+        print("[✓] Original keymaps restored.")
+        return
 
     # Uninstall is handled first without constructing managers
     if args.uninstall:
@@ -236,19 +231,66 @@ def main():
     if (args.start or args.stop or args.status or args.auto or
             args.reset_devices or args.auto_start or args.enable_autostart or
             args.disable_autostart or args.toggle_autostart):
+        if args.start or args.auto_start:
+            from core.preflight import preflight
+            pref = preflight()
+            for w in pref.warnings:
+                logger.warning(f"Preflight warning: {w}")
+            if not pref.ok:
+                for err in pref.errors:
+                    logger.error(f"Preflight error: {err}")
+                sys.exit(1)
         run_cli(args)
         return
 
     # Default: Run GTK3 GUI
+    # If a Control Board GUI is already running, activate it and exit immediately
+    from core.hotkey_manager import send_overlay_command
+    target = args.seat or "seat1"
+    if send_overlay_command(f"SHOW {target}"):
+        print(f"[✓] Control Board GUI is already running. Brought window to front on {target}.")
+        return
+
+    from core.preflight import preflight
+    pref = preflight()
+    for w in pref.warnings:
+        logger.warning(f"Preflight warning: {w}")
+    if not pref.ok:
+        for err in pref.errors:
+            logger.error(f"Preflight error: {err}")
+        sys.exit(1)
     try:
         import gi
         gi.require_version('Gtk', '3.0')
-        from gi.repository import Gtk
+        from gi.repository import Gtk, GLib, Gio
         from gui.app import XInputMultiseatApp
 
-        app = XInputMultiseatApp(overlay_mode=args.overlay, target_seat=args.seat or "seat1")
-        app.show_all()
-        Gtk.main()
+        class MultiseatApplication(Gtk.Application):
+            def __init__(self):
+                super().__init__(
+                    application_id="org.xinput.multiseat",
+                    flags=Gio.ApplicationFlags.FLAGS_NONE,
+                )
+                self.win = None
+
+            def do_activate(self):
+                if not self.win:
+                    self.win = XInputMultiseatApp(
+                        overlay_mode=args.overlay,
+                        target_seat=args.seat or "seat1",
+                        application=self,
+                    )
+                    self.win.show_all()
+                else:
+                    self.win.present()
+
+        gtk_app = MultiseatApplication()
+        for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+            try:
+                signal.signal(sig, lambda *_: GLib.idle_add(gtk_app.quit))
+            except Exception:
+                pass
+        sys.exit(gtk_app.run([sys.argv[0]]))
     except Exception as exc:
         logger.error(f"Failed to launch GTK GUI: {exc}")
         print("\nNote: Running in headless CLI mode fallback (--status):")

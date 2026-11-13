@@ -37,7 +37,9 @@ if str(PROJECT_DIR) not in sys.path:
 
 from core import overlay_state
 from core.device_manager import DeviceManager
+from core.logging_setup import setup_logging
 
+setup_logging()
 logger = logging.getLogger("xinput_seating.display_dialog")
 
 DIALOG_CSS = b"""
@@ -119,6 +121,7 @@ class DisplayDialog(Gtk.Window):
         disconnected_display: str = "",
         seat_id: str = "seat2",
         on_success_callback=None,
+        standalone: bool = False,
     ):
         super().__init__(type=Gtk.WindowType.TOPLEVEL)
         self.mode = mode
@@ -126,6 +129,7 @@ class DisplayDialog(Gtk.Window):
         self.disconnected_display = disconnected_display
         self.seat_id = seat_id
         self.on_success_callback = on_success_callback
+        self.standalone = standalone
         self.dm = DeviceManager()
         self.success_displays: Optional[List[Dict]] = None
 
@@ -338,7 +342,7 @@ class DisplayDialog(Gtk.Window):
 
     def _close_and_quit(self, exit_code: int = 0):
         self.destroy()
-        if Gtk.main_level() > 0:
+        if self.standalone and Gtk.main_level() > 0:
             Gtk.main_quit()
         return False
 
@@ -351,22 +355,6 @@ class DisplayDialog(Gtk.Window):
             self._auto_check_id = None
         overlay_state.clear("dialog")
 
-
-def run_single_display_error_modal(active_displays: List[Dict]) -> Tuple[bool, Optional[List[Dict]]]:
-    """
-    Shows modal error dialog when only one display is detected at launch.
-    Blocks until user clicks Retry (and 2 displays are found) or Cancel.
-    Returns (True, new_active_displays) on success, or (False, None) if cancelled.
-    """
-    disp_name = active_displays[0]["name"] if active_displays else "Unknown"
-    dlg = DisplayDialog(mode="error", active_display=disp_name)
-    dlg.present()
-    dlg.show_all()
-    Gtk.main()
-
-    if dlg.success_displays and len(dlg.success_displays) >= 2:
-        return True, dlg.success_displays
-    return False, None
 
 
 def main():
@@ -387,6 +375,7 @@ def main():
         active_display=active_name,
         disconnected_display=args.disconnected,
         seat_id=args.seat,
+        standalone=True,
     )
     dlg.connect("destroy", lambda _: Gtk.main_quit())
     dlg.present()

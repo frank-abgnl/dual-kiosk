@@ -5,9 +5,9 @@
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-export PYTHONPATH="${SCRIPT_DIR}:${PYTHONPATH}"
+export PYTHONPATH="${SCRIPT_DIR}${PYTHONPATH:+:$PYTHONPATH}"
 export PATH="${HOME}/.local/bin:${PATH}"
-export LD_LIBRARY_PATH="${HOME}/.local/lib:${LD_LIBRARY_PATH}"
+export LD_LIBRARY_PATH="${HOME}/.local/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 
 # Dependency check
 MISSING=()
@@ -19,10 +19,11 @@ command -v xdotool >/dev/null 2>&1 || MISSING+=("xdotool")
 command -v xkbcomp >/dev/null 2>&1 || MISSING+=("xorg-xkbcomp")
 
 if [ ${#MISSING[@]} -gt 0 ]; then
-    echo "[!] Warning: The following dependencies are missing: ${MISSING[*]}"
-    echo "    On Arch/CachyOS: sudo pacman -S --needed ${MISSING[*]}"
-    echo "    On Debian/Ubuntu: sudo apt-get install -y ${MISSING[*]/xorg-xkbcomp/x11-xkb-utils}"
-    echo ""
+    echo "[!] Error: The following required dependencies are missing: ${MISSING[*]}" >&2
+    echo "    On Arch/CachyOS: sudo pacman -S --needed ${MISSING[*]}" >&2
+    echo "    On Debian/Ubuntu: sudo apt-get install -y ${MISSING[*]/xorg-xkbcomp/x11-xkb-utils}" >&2
+    echo "" >&2
+    exit 1
 fi
 python3 -c "import Xlib" >/dev/null 2>&1 || echo "[!] python-xlib missing (kiosk shield window policing disabled): pip install --user python-xlib"
 

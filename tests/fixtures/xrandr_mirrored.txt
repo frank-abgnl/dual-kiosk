@@ -1,0 +1,5 @@
+Screen 0: minimum 16 x 16, current 1920 x 1080, maximum 32767 x 32767
+HDMI-1 connected primary 1920x1080+0+0 (normal left inverted right x axis y axis) 531mm x 299mm
+   1920x1080     60.00*+
+DP-1 connected 1920x1080+0+0 (normal left inverted right x axis y axis) 531mm x 299mm
+   1920x1080     60.00*+

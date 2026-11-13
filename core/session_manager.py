@@ -20,17 +20,30 @@ import signal
 import subprocess
 import sys
 import time
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Callable, Dict, Iterator, List, Optional, Tuple
+
+from core.paths import CONFIG_DIR, PID_FILE, LOCK_FILE, LOG_FILE, PROFILES_DIR
 
 logger = logging.getLogger("xinput_seating.session")
 
-CONFIG_DIR = Path.home() / ".config" / "xinput-seats"
-PID_FILE = CONFIG_DIR / "launcher.pid"
-LOCK_FILE = CONFIG_DIR / "launcher.lock"
-LOG_FILE = CONFIG_DIR / "launcher.log"
 
-CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+@dataclass
+class StartResult:
+    ok: bool
+    code: str
+    message: str
+
+    OK = "OK"
+    NEED_DISPLAYS = "NEED_DISPLAYS"
+    NEED_DEVICES = "NEED_DEVICES"
+    KIOSK_FAILED = "KIOSK_FAILED"
+    ALREADY_RUNNING = "ALREADY_RUNNING"
+
+    def __iter__(self) -> Iterator:
+        yield self.ok
+        yield self.message
 
 
 def _pid_alive(pid: int) -> bool:
@@ -140,6 +153,15 @@ class SessionManager:
             except Exception:
                 pass
             self.hotkey_mgr = None
+        try:
+            self.kiosk.stop_shield()
+        except Exception:
+            pass
+        try:
+            from core.kiosk_shield import restore_all_keymaps
+            restore_all_keymaps()
+        except Exception:
+            pass
 
     # -----------------------------------------------------------------------
     # Unified Shut-Down Wrapper
@@ -218,7 +240,7 @@ class SessionManager:
 
         # Double check with pkill -f for isolated profile dirs
         try:
-            prof_dir = str(Path.home() / ".config" / "xinput-seats" / "profiles")
+            prof_dir = str(PROFILES_DIR)
             subprocess.run(["pkill", "-9", "-f", prof_dir], capture_output=True)
         except Exception:
             pass
@@ -245,7 +267,6 @@ class SessionManager:
 
         try:
             PID_FILE.unlink(missing_ok=True)
-            LOCK_FILE.unlink(missing_ok=True)
         except Exception:
             pass
 
@@ -260,12 +281,12 @@ class SessionManager:
         reassign: bool = False,
         no_detect: bool = False,
         on_event: Optional[Callable[[str], None]] = None,
-    ) -> Tuple[bool, str]:
+        allow_partial: Optional[bool] = None,
+    ) -> StartResult:
         """
         Unified start-up wrapper.
-        Validates displays (modal with Retry if < 2 displays), assigns seats respecting
-        preference & priority rules, applies seating, launches dual kiosks, and starts
-        supervisors.
+        Validates displays, assigns seats respecting preference & priority rules,
+        applies seating, launches dual kiosks, and starts supervisors.
         """
         def _emit(msg: str):
             logger.info(msg)
@@ -285,15 +306,10 @@ class SessionManager:
         # 1. Automatic Display Detection: Require at least 2 connected active displays
         active_displays, total = self.dm.probe_and_activate_displays()
         if len(active_displays) < 2:
-            disp_name = active_displays[0]["name"] if active_displays else "Unknown"
-            _emit(f"Only 1 display detected ({disp_name}). Dual-seat kiosk requires 2 monitors.")
-            from gui.display_dialog import run_single_display_error_modal
-            ok_retry, new_disp = run_single_display_error_modal(active_displays)
-            if not ok_retry or not new_disp or len(new_disp) < 2:
-                _emit("Launch aborted: Second display required.")
-                return False, "Dual kiosks require at least two connected displays."
-            active_displays = new_disp
-            total = self.dm.get_displays()[1]
+            disp_names = ", ".join(d.get("name", "Unknown") for d in active_displays) or "none"
+            msg = f"Only {len(active_displays)} display(s) detected: {disp_names}"
+            _emit(f"Fewer than 2 displays detected ({disp_names}). Dual-seat kiosk requires 2 monitors.")
+            return StartResult(ok=False, code=StartResult.NEED_DISPLAYS, message=msg)
 
         displays = active_displays
 
@@ -320,6 +336,7 @@ class SessionManager:
             s.pop("pointer_connected", None)
             s.pop("keyboard_connected", None)
         cfg["seats"] = resolved
+        seats = resolved
         self.cfg_mgr.save_config(cfg)
 
         for (sid, cls), dev in sorted(assignments.items()):
@@ -327,48 +344,80 @@ class SessionManager:
             _emit(f"  {sid} {cls}: " + (f"{dev['name']} (ID {dev['id']})" if dev else "not connected")
                   + f"   display={seat.get('display')}")
 
+        # Check for missing devices if partial seating is not allowed
+        missing_devs = []
+        for s in resolved:
+            sid = s.get("id", "seat")
+            if not s.get("mouse_id"):
+                missing_devs.append(f"{sid} mouse")
+            if not s.get("keyboard_id"):
+                missing_devs.append(f"{sid} keyboard")
+
+        effective_allow_partial = allow_partial
+        if effective_allow_partial is None:
+            effective_allow_partial = cfg.get("settings", {}).get("allow_partial_seats", False)
+
+        if missing_devs and not effective_allow_partial:
+            msg = f"Missing input device(s): {', '.join(missing_devs)}"
+            _emit(f"{msg}. Dual-seat kiosk requires dedicated mouse and keyboard for each seat.")
+            return StartResult(ok=False, code=StartResult.NEED_DEVICES, message=msg)
+
         # 3. Apply XInput pseudo-seating (MPX masters + confinement)
         _emit("Applying XInput MPX master pairs and device reattachments...")
-        results = self.engine.apply_seating(seats, displays, (total["width"], total["height"]))
+        settings = cfg.get("settings", {})
+        confine = settings.get("confine_mouse_to_screen", True)
+        results = self.engine.apply_seating(
+            seats, displays, (total["width"], total["height"]),
+            confine_mouse_to_screen=confine,
+        )
         _emit(f"Seating applied: {results}")
 
         # 4. Launch dual Firefox kiosks
         _emit("Launching dual Firefox kiosks with isolated profiles...")
         s1_url = seats[0].get("kiosk_url") if len(seats) > 0 else "https://duckduckgo.com"
         s2_url = seats[1].get("kiosk_url") if len(seats) > 1 else "https://www.google.com"
+        watchdog_interval = float(settings.get("watchdog_interval_sec", 1.5))
+        self.kiosk.idle_reset_minutes = int(settings.get("idle_reset_minutes", 0))
 
         ok = self.kiosk.launch_dual_kiosks(
             seat1_url=s1_url or "https://duckduckgo.com",
             seat2_url=s2_url or "https://www.google.com",
             displays_info=displays,
             enforce_lock=True,
+            seat_configs=seats,
+            watchdog_interval_sec=watchdog_interval,
         )
 
         if ok:
             PID_FILE.write_text(str(os.getpid()))
             self._start_runtime_services(on_event=on_event)
             _emit("Dual Firefox kiosks launched successfully!")
-            return True, "Dual Firefox kiosks running."
+            return StartResult(ok=True, code=StartResult.OK, message="Dual Firefox kiosks running.")
         else:
             _emit("Failed to launch one or more Firefox kiosks.")
-            return False, "Failed to launch Firefox kiosks."
+            return StartResult(ok=False, code=StartResult.KIOSK_FAILED, message="Failed to launch Firefox kiosks.")
 
     def restart_session(
         self,
         reassign: bool = False,
         on_event: Optional[Callable[[str], None]] = None,
-    ) -> Tuple[bool, str]:
+        allow_partial: Optional[bool] = None,
+    ) -> StartResult:
         """Stops any running session (without exiting the GUI) and starts a fresh session."""
         self.stop_session(exit_gui=False, on_event=on_event)
         time.sleep(0.5)
-        return self.start_session(reassign=reassign, no_detect=False, on_event=on_event)
+        return self.start_session(reassign=reassign, no_detect=False, on_event=on_event, allow_partial=allow_partial)
 
     def reseat_session(
         self,
         hard: bool = False,
         on_event: Optional[Callable[[str], None]] = None,
     ) -> bool:
-        """Re-seats all devices of a running session (soft = keep browsers, hard = restart browsers)."""
+        """
+        Re-seats all devices of a running session.
+        Soft (hard=False): keeps kiosks running and hotplug-reseats devices without destroying masters.
+        Hard (hard=True): restarts kiosks and resets all seating from scratch.
+        """
         def _emit(msg: str):
             logger.info(msg)
             if on_event:
@@ -385,23 +434,30 @@ class SessionManager:
                 and all(p.poll() is None for p in self.kiosk.running_processes.values())
             )
             if hard or not alive:
-                ok, _ = self.restart_session(reassign=False, on_event=on_event)
-                return ok
+                _emit("Hard reseat requested or kiosks dead: restarting session...")
+                res = self.restart_session(reassign=False, on_event=on_event)
+                return res.ok
 
-            _emit("Re-seating all seats...")
-            self.engine.reset_all_to_core()
-            displays_now, total_now = self.dm.get_displays()
-            cfg_now = self.cfg_mgr.auto_generate_config(self.dm, force_reassign=False)
+            _emit("Soft re-seating devices (keeping browser kiosks running)...")
+            self.engine.force_recheck()
+            cfg_now = self.cfg_mgr.load_config()
             seats_now = cfg_now.get("seats", [])
-            seats_now, _ = self.dm.assign_displays_to_seats(seats_now, displays_now)
-            cfg_now["seats"] = seats_now
-            self.cfg_mgr.save_config(cfg_now)
-            self.engine.apply_seating(seats_now, displays_now, (total_now["width"], total_now["height"]))
-            if self.reseat_key:
-                self.reseat_key.update_seat_keyboards(self.engine.seat_keyboards)
+            displays_now, total_now = self.dm.get_displays()
+            total_geom = (total_now["width"], total_now["height"]) if total_now else None
+
+            msgs = self.engine.check_and_reseat_hotplugged_devices(
+                seats_now,
+                displays_info=displays_now,
+                total_screen=total_geom,
+            )
+            for m in msgs:
+                _emit(f"Reseat: {m}")
+
+            # Re-focus running kiosks to their seat keyboards
             for sid, win in list(self.kiosk.window_ids.items()):
                 self.engine.focus_seat_keyboard(sid, win)
-            _emit("Seats re-assigned.")
+
+            _emit("Soft re-seat complete.")
             return True
         except Exception as exc:
             logger.exception("Re-seat failed")

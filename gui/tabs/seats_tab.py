@@ -6,7 +6,10 @@ Provides configuration cards for Seat 1 and Seat 2 (monitors, mice, keyboards, F
 import gi
 gi.require_version('Gtk', '3.0')
 from gi.repository import Gtk, GLib
+import logging
 import threading
+
+logger = logging.getLogger("xinput_seating.gui.seats")
 
 
 class SeatCard(Gtk.Frame):
@@ -55,16 +58,28 @@ class SeatCard(Gtk.Frame):
         lbl_mouse.set_halign(Gtk.Align.END)
         grid.attach(lbl_mouse, 0, 1, 1, 1)
 
+        m_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
         self.combo_mouse = Gtk.ComboBoxText()
-        grid.attach(self.combo_mouse, 1, 1, 1, 1)
+        m_box.pack_start(self.combo_mouse, True, True, 0)
+        self.lbl_mouse_port = Gtk.Label(label="")
+        m_box.pack_start(self.lbl_mouse_port, False, False, 0)
+        self.chk_bind_mouse_port = Gtk.CheckButton(label="Bind to this USB port")
+        m_box.pack_start(self.chk_bind_mouse_port, False, False, 0)
+        grid.attach(m_box, 1, 1, 1, 1)
 
         # Row 2: Keyboard
         lbl_kbd = Gtk.Label(label="Assigned Keyboard:")
         lbl_kbd.set_halign(Gtk.Align.END)
         grid.attach(lbl_kbd, 0, 2, 1, 1)
 
+        k_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
         self.combo_kbd = Gtk.ComboBoxText()
-        grid.attach(self.combo_kbd, 1, 2, 1, 1)
+        k_box.pack_start(self.combo_kbd, True, True, 0)
+        self.lbl_kbd_port = Gtk.Label(label="")
+        k_box.pack_start(self.lbl_kbd_port, False, False, 0)
+        self.chk_bind_kbd_port = Gtk.CheckButton(label="Bind to this USB port")
+        k_box.pack_start(self.chk_bind_kbd_port, False, False, 0)
+        grid.attach(k_box, 1, 2, 1, 1)
 
         # Row 3: Peripheral Locking to Display
         lbl_lock = Gtk.Label(label="Peripheral Lock:")
@@ -154,6 +169,16 @@ class SeatCard(Gtk.Frame):
         if pointers or selected_mouse_name:
             self.combo_mouse.set_active(active_mouse_idx)
 
+        # Mouse port display & binding
+        mouse_port = (pointers[active_mouse_idx].get("port") or pointers[active_mouse_idx].get("usb_path")) if active_mouse_idx < len(pointers) else ""
+        if mouse_port:
+            self.lbl_mouse_port.set_markup(f"<span size='small' color='#6b7280'>Port: <b>{mouse_port}</b></span>")
+            self.chk_bind_mouse_port.set_sensitive(True)
+        else:
+            self.lbl_mouse_port.set_markup("<span size='small' color='#6b7280'>Port: N/A</span>")
+            self.chk_bind_mouse_port.set_sensitive(False)
+        self.chk_bind_mouse_port.set_active(bool(current_cfg.get("mouse_port")))
+
         # 3. Keyboards (match by locked peripheral name first, then ID)
         self.combo_kbd.remove_all()
         selected_kbd_id = current_cfg.get("keyboard_id")
@@ -177,6 +202,16 @@ class SeatCard(Gtk.Frame):
 
         if keyboards or selected_kbd_name:
             self.combo_kbd.set_active(active_kbd_idx)
+
+        # Keyboard port display & binding
+        kbd_port = (keyboards[active_kbd_idx].get("port") or keyboards[active_kbd_idx].get("usb_path")) if active_kbd_idx < len(keyboards) else ""
+        if kbd_port:
+            self.lbl_kbd_port.set_markup(f"<span size='small' color='#6b7280'>Port: <b>{kbd_port}</b></span>")
+            self.chk_bind_kbd_port.set_sensitive(True)
+        else:
+            self.lbl_kbd_port.set_markup("<span size='small' color='#6b7280'>Port: N/A</span>")
+            self.chk_bind_kbd_port.set_sensitive(False)
+        self.chk_bind_kbd_port.set_active(bool(current_cfg.get("keyboard_port")))
 
         # 4. Peripheral Lock state & status badge
         is_locked = current_cfg.get("lock_peripherals", True)
@@ -235,6 +270,14 @@ class SeatCard(Gtk.Frame):
 
         lock_periph = self.chk_lock_peripherals.get_active()
 
+        mouse_port = None
+        if self.chk_bind_mouse_port.get_active() and mouse_idx >= 0 and mouse_idx < len(pointers):
+            mouse_port = pointers[mouse_idx].get("port") or pointers[mouse_idx].get("usb_path")
+
+        kbd_port = None
+        if self.chk_bind_kbd_port.get_active() and kbd_idx >= 0 and kbd_idx < len(keyboards):
+            kbd_port = keyboards[kbd_idx].get("port") or keyboards[kbd_idx].get("usb_path")
+
         return {
             "id": self.seat_id,
             "name": f"Seat {self.seat_index + 1} ({'Primary' if self.is_primary else 'Secondary'})",
@@ -242,8 +285,10 @@ class SeatCard(Gtk.Frame):
             "display": disp_name,
             "mouse_id": mouse_id,
             "mouse_name": mouse_name,
+            "mouse_port": mouse_port,
             "keyboard_id": kbd_id,
             "keyboard_name": kbd_name,
+            "keyboard_port": kbd_port,
             "lock_peripherals": lock_periph,
             "locked_display": disp_name if lock_periph else None,
             "profile_name": self.ent_profile.get_text().strip() or self.seat_id,
@@ -278,18 +323,18 @@ class SeatsTab(Gtk.Box):
 
         top.pack_start(Gtk.Separator(orientation=Gtk.Orientation.VERTICAL), False, False, 4)
 
-        btn_auto = Gtk.Button(label="⚡  Auto-Detect & Assign")
-        btn_auto.connect("clicked", self._on_auto_detect)
-        top.pack_start(btn_auto, False, False, 0)
+        self.btn_auto = Gtk.Button(label="⚡  Auto-Detect & Assign")
+        self.btn_auto.connect("clicked", self._on_auto_detect)
+        top.pack_start(self.btn_auto, False, False, 0)
 
-        btn_save = Gtk.Button(label="💾  Save Configuration")
-        btn_save.get_style_context().add_class("btn-primary")
-        btn_save.connect("clicked", self._on_save_config)
-        top.pack_start(btn_save, False, False, 0)
+        self.btn_save = Gtk.Button(label="💾  Save Configuration")
+        self.btn_save.get_style_context().add_class("btn-primary")
+        self.btn_save.connect("clicked", self._on_save_config)
+        top.pack_start(self.btn_save, False, False, 0)
 
-        btn_refresh = Gtk.Button(label="🔄  Refresh Hardware")
-        btn_refresh.connect("clicked", lambda _: self.refresh())
-        top.pack_end(btn_refresh, False, False, 0)
+        self.btn_refresh = Gtk.Button(label="🔄  Refresh Hardware")
+        self.btn_refresh.connect("clicked", lambda b: self.refresh(b))
+        top.pack_end(self.btn_refresh, False, False, 0)
 
         # Scrolled container for seat cards
         sw = Gtk.ScrolledWindow()
@@ -307,16 +352,23 @@ class SeatsTab(Gtk.Box):
 
         self.refresh()
 
-    def refresh(self):
+    def refresh(self, btn=None):
         """Fetches hardware and updates seat card dropdowns."""
+        target_btn = btn or getattr(self, "btn_refresh", None)
+        if target_btn and hasattr(target_btn, "set_sensitive"):
+            target_btn.set_sensitive(False)
         threading.Thread(target=self._fetch_hw_bg, daemon=True).start()
 
     def _fetch_hw_bg(self):
-        displays, _ = self.app.device_mgr.get_displays()
-        pointers = self.app.device_mgr.get_usable_pointers()
-        keyboards = self.app.device_mgr.get_usable_keyboards()
-        cfg = self.app.config_mgr.load_config()
-        seats_cfg = cfg.get("seats", [{}, {}])
+        try:
+            displays, _ = self.app.device_mgr.get_displays()
+            pointers = self.app.device_mgr.get_usable_pointers()
+            keyboards = self.app.device_mgr.get_usable_keyboards()
+            cfg = self.app.config_mgr.load_config()
+            seats_cfg = cfg.get("seats", [{}, {}])
+        except Exception as exc:
+            logger.error(f"Error fetching hardware: {exc}")
+            displays, pointers, keyboards, seats_cfg = [], [], [], [{}, {}]
 
         self._cached_displays = displays
         self._cached_pointers = pointers
@@ -325,39 +377,119 @@ class SeatsTab(Gtk.Box):
         GLib.idle_add(self._populate_ui, displays, pointers, keyboards, seats_cfg)
 
     def _populate_ui(self, displays, pointers, keyboards, seats_cfg):
+        if getattr(self, "btn_refresh", None) and hasattr(self.btn_refresh, "set_sensitive"):
+            self.btn_refresh.set_sensitive(True)
         s1_cfg = seats_cfg[0] if len(seats_cfg) > 0 else {}
         s2_cfg = seats_cfg[1] if len(seats_cfg) > 1 else {}
 
         self.card_seat1.populate_dropdowns(displays, pointers, keyboards, s1_cfg)
         self.card_seat2.populate_dropdowns(displays, pointers, keyboards, s2_cfg)
 
-    def _on_auto_detect(self, _btn):
+    def _on_auto_detect(self, btn=None):
+        target_btn = btn or getattr(self, "btn_auto", None)
+        if target_btn and hasattr(target_btn, "set_sensitive"):
+            target_btn.set_sensitive(False)
         self.app.show_info("Auto-detecting hardware layout and mapping seats...", 0)
-        cfg = self.app.config_mgr.auto_generate_config(self.app.device_mgr)
-        self.app.dashboard_tab.append_log("Auto-detection applied to Seat 1 and Seat 2.")
-        self.refresh()
-        self.app.show_info("Hardware auto-assigned to Seat 1 and Seat 2 ✓", 0)
 
-    def _on_save_config(self, _btn):
+        def _worker():
+            try:
+                self.app.config_mgr.auto_generate_config(self.app.device_mgr)
+                err = None
+            except Exception as exc:
+                err = exc
+
+            def _done():
+                if target_btn and hasattr(target_btn, "set_sensitive"):
+                    target_btn.set_sensitive(True)
+                if err:
+                    self.app.show_info(f"Auto-detection failed: {err}", 1)
+                else:
+                    self.app.dashboard_tab.append_log("Auto-detection applied to Seat 1 and Seat 2.")
+                    self.refresh()
+                    self.app.show_info("Hardware auto-assigned to Seat 1 and Seat 2 ✓", 0)
+                return False
+
+            GLib.idle_add(_done)
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _on_save_config(self, btn=None):
+        target_btn = btn or getattr(self, "btn_save", None)
+        if target_btn and hasattr(target_btn, "set_sensitive"):
+            target_btn.set_sensitive(False)
+
         s1_data = self.card_seat1.get_configured_data(
             self._cached_displays, self._cached_pointers, self._cached_keyboards
         )
         s2_data = self.card_seat2.get_configured_data(
             self._cached_displays, self._cached_pointers, self._cached_keyboards
         )
+        new_seats = [s1_data, s2_data]
 
-        cfg = self.app.config_mgr.load_config()
-        cfg["seats"] = [s1_data, s2_data]
+        def _merge_seat(existing: dict, updated: dict) -> dict:
+            merged = dict(existing)
+            merged.update(updated)
 
-        ok = self.app.config_mgr.save_config(cfg)
-        if ok:
-            self.app.show_info("Configuration saved successfully ✓", 0)
-            self.app.dashboard_tab.append_log("Configuration saved to ~/.config/xinput-seats/config.json")
-            if s1_data.get("lock_peripherals"):
-                self.app.dashboard_tab.append_log(f"🔒 Locked Seat 1 peripherals to '{s1_data['display']}': Mouse '{s1_data.get('mouse_name')}', Kbd '{s1_data.get('keyboard_name')}'")
-            if s2_data.get("lock_peripherals"):
-                self.app.dashboard_tab.append_log(f"🔒 Locked Seat 2 peripherals to '{s2_data['display']}': Mouse '{s2_data.get('mouse_name')}', Kbd '{s2_data.get('keyboard_name')}'")
-            self.refresh()
-            self.app.dashboard_tab.refresh_metrics()
-        else:
-            self.app.show_info("Failed to save configuration!", 1)
+            # Preserve device identities, product IDs, and display geometry
+            for field in (
+                "mouse_ident",
+                "keyboard_ident",
+                "mouse_product_id",
+                "keyboard_product_id",
+                "resolution",
+                "width",
+                "height",
+            ):
+                if field in existing and field not in updated:
+                    merged[field] = existing[field]
+                elif field in existing and updated.get(field) in (None, ""):
+                    if "mouse" in field and existing.get("mouse_name") == updated.get("mouse_name"):
+                        merged[field] = existing[field]
+                    elif "keyboard" in field and existing.get("keyboard_name") == updated.get("keyboard_name"):
+                        merged[field] = existing[field]
+
+            return merged
+
+        def mutator(cfg: dict):
+            current_seats = cfg.get("seats", [])
+            merged_list = []
+            for i, new_s in enumerate(new_seats):
+                sid = new_s.get("id")
+                existing = next((s for s in current_seats if s.get("id") == sid), None)
+                if existing is None and i < len(current_seats):
+                    existing = current_seats[i]
+                if existing:
+                    merged_list.append(_merge_seat(existing, new_s))
+                else:
+                    merged_list.append(dict(new_s))
+            cfg["seats"] = merged_list
+
+        def _worker():
+            try:
+                self.app.config_mgr.update(mutator)
+                ok = True
+                err = None
+            except Exception as exc:
+                logger.error(f"Failed to save config: {exc}")
+                ok = False
+                err = exc
+
+            def _done():
+                if target_btn and hasattr(target_btn, "set_sensitive"):
+                    target_btn.set_sensitive(True)
+                if ok:
+                    self.app.show_info("Configuration saved successfully ✓", 0)
+                    self.app.dashboard_tab.append_log("Configuration saved to ~/.config/xinput-seats/config.json")
+                    if s1_data.get("lock_peripherals"):
+                        self.app.dashboard_tab.append_log(f"🔒 Locked Seat 1 peripherals to '{s1_data['display']}': Mouse '{s1_data.get('mouse_name')}', Kbd '{s1_data.get('keyboard_name')}'")
+                    if s2_data.get("lock_peripherals"):
+                        self.app.dashboard_tab.append_log(f"🔒 Locked Seat 2 peripherals to '{s2_data['display']}': Mouse '{s2_data.get('mouse_name')}', Kbd '{s2_data.get('keyboard_name')}'")
+                    self.refresh()
+                    self.app.dashboard_tab.refresh_metrics()
+                else:
+                    self.app.show_info(f"Failed to save configuration: {err}", 1)
+                return False
+
+            GLib.idle_add(_done)
+
+        threading.Thread(target=_worker, daemon=True).start()

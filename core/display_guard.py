@@ -129,7 +129,7 @@ class DisplayGuard:
     MISS_TO_SLEEP = 2   # consecutive polls without the display before sleeping
     HIT_TO_WAKE = 1     # polls with the display before waking
 
-    def __init__(self, kiosk_mgr, engine=None, interval: float = 1.0,
+    def __init__(self, kiosk_mgr, engine=None, interval: float = 2.0,
                  on_event: Optional[Callable[[str], None]] = None):
         from core.config_manager import ConfigManager
         from core.device_manager import DeviceManager
@@ -177,7 +177,7 @@ class DisplayGuard:
                 logger.debug(f"on_event failed: {exc}")
 
     def _loop(self):
-        while not self._stop.wait(0.3 if self._warning_proc else self.interval):
+        while not self._stop.wait(1.0 if self._warning_proc else self.interval):
             try:
                 self._tick()
             except Exception as exc:
@@ -262,7 +262,8 @@ class DisplayGuard:
             for a in acts:
                 self._emit(f"🖥 Display settings -> extended mode: {a}")
             if acts:
-                time.sleep(2.0)
+                if self._stop.wait(2.0):
+                    return
                 self._relayout(seats)
             return
 

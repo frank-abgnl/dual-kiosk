@@ -12,15 +12,180 @@ long as this process (GUI or `--start` CLI) stays running.
 """
 
 import ctypes
-import ctypes.util
 import logging
 import threading
 from typing import Dict, List, Optional, Tuple
+
+from core.x11 import (
+    load_x11,
+    open_display,
+    _XIButtonState,
+    _XIModifierState,
+    _XIGroupState,
+)
 
 logger = logging.getLogger("xinput_seating.barriers")
 
 # XFixes "directions" = directions in which the barrier does NOT block.
 POSITIVE_X, NEGATIVE_X, POSITIVE_Y, NEGATIVE_Y = 1, 2, 4, 8
+
+
+def is_point_in_rect(px: float, py: float, rect: Tuple[int, int, int, int]) -> bool:
+    """True if point (px, py) is strictly inside rect (x, y, w, h)."""
+    rx, ry, rw, rh = rect
+    return (rx <= px < rx + rw) and (ry <= py < ry + rh)
+
+
+def compute_barrier_edges(
+    x: int, y: int, w: int, h: int, total_screen: Optional[Tuple[int, int]] = None
+) -> List[Tuple[int, int, int, int, int]]:
+    """
+    Computes barrier coordinates and allowed directions for a monitor rectangle.
+    Barriers are only created for interior boundaries (adjacent to other screens);
+    outer edges that touch the screen canvas boundary require no barriers.
+    Returns list of (x1, y1, x2, y2, allowed_direction).
+    """
+    tw, th = total_screen or (0, 0)
+    edges = []
+    if x > 0:
+        edges.append((x, y, x, y + h, POSITIVE_X))            # left edge: allow entering from left
+    if tw == 0 or x + w < tw:
+        edges.append((x + w, y, x + w, y + h, NEGATIVE_X))    # right edge: allow entering from right
+    if y > 0:
+        edges.append((x, y, x + w, y, POSITIVE_Y))            # top edge: allow entering from top
+    if th == 0 or y + h < th:
+        edges.append((x, y + h, x + w, y + h, NEGATIVE_Y))    # bottom edge: allow entering from bottom
+    return edges
+
+
+def nearest_point_in_rect(px: float, py: float, rect: Tuple[int, int, int, int]) -> Tuple[float, float]:
+    """
+    Clamps (px, py) to the nearest point inside rect=(x, y, w, h).
+    Uses a 1-pixel interior margin so the pointer stays strictly inside boundaries.
+    """
+    rx, ry, rw, rh = rect
+    min_x = float(rx)
+    max_x = float(rx + max(0, rw - 1))
+    min_y = float(ry)
+    max_y = float(ry + max(0, rh - 1))
+
+    clamped_x = min(max(px, min_x), max_x)
+    clamped_y = min(max(py, min_y), max_y)
+    return (clamped_x, clamped_y)
+
+
+class ConfinementWatchdog:
+    """
+    Safety net thread that periodically checks all confined master pointers.
+    If a pointer escaped its barrier (e.g. via fast mouse movement or WM event),
+    it warps it back to the nearest point inside its monitor rectangle.
+    If XIQueryPointer fails (e.g. BadDevice because master was removed),
+    it drops that master from confinement.
+    """
+
+    def __init__(self, confiner: "PointerConfiner", interval: float = 0.25):
+        self.confiner = confiner
+        self.interval = interval
+        self._stop_event = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+
+    def start(self):
+        if self._thread and self._thread.is_alive():
+            return
+        self._stop_event.clear()
+        self._thread = threading.Thread(target=self._run, name="ConfinementWatchdog", daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self._stop_event.set()
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=1.0)
+        self._thread = None
+
+    def is_running(self) -> bool:
+        return self._thread is not None and self._thread.is_alive()
+
+    def _run(self):
+        try:
+            x11, xi, _ = load_x11()
+            dpy = open_display()
+            if not dpy:
+                logger.debug("ConfinementWatchdog: Cannot open display")
+                return
+            root = x11.XDefaultRootWindow(dpy)
+            try:
+                while not self._stop_event.wait(self.interval):
+                    self.check_all(dpy, root, x11, xi)
+            finally:
+                x11.XCloseDisplay(dpy)
+        except Exception as exc:
+            logger.debug(f"ConfinementWatchdog thread exit: {exc}")
+
+    def query_pointer(self, dpy, root, xi, x11, master_id: int) -> Tuple[bool, float, float]:
+        root_ret = ctypes.c_ulong()
+        child_ret = ctypes.c_ulong()
+        root_x = ctypes.c_double()
+        root_y = ctypes.c_double()
+        win_x = ctypes.c_double()
+        win_y = ctypes.c_double()
+        btn = _XIButtonState()
+        mods = _XIModifierState()
+        grp = _XIGroupState()
+
+        res = xi.XIQueryPointer(
+            dpy,
+            int(master_id),
+            root,
+            ctypes.byref(root_ret),
+            ctypes.byref(child_ret),
+            ctypes.byref(root_x),
+            ctypes.byref(root_y),
+            ctypes.byref(win_x),
+            ctypes.byref(win_y),
+            ctypes.byref(btn),
+            ctypes.byref(mods),
+            ctypes.byref(grp),
+        )
+        if btn.mask:
+            x11.XFree(btn.mask)
+
+        if res == 0:
+            return False, 0.0, 0.0
+        return True, root_x.value, root_y.value
+
+    def check_all(self, dpy, root, x11, xi):
+        with self.confiner._lock:
+            targets = dict(self.confiner._confined_rects)
+
+        dropped = []
+        for master_id, rect in targets.items():
+            ok, px, py = self.query_pointer(dpy, root, xi, x11, master_id)
+            if not ok:
+                logger.warning(f"ConfinementWatchdog: master {master_id} returned error on query; dropping.")
+                dropped.append(master_id)
+                continue
+
+            if not is_point_in_rect(px, py, rect):
+                nx, ny = nearest_point_in_rect(px, py, rect)
+                logger.debug(f"Master {master_id} escaped ({px}, {py}); warping back to ({nx}, {ny}) in {rect}")
+                xi.XIWarpPointer(
+                    dpy,
+                    int(master_id),
+                    0,
+                    root,
+                    0.0,
+                    0.0,
+                    0,
+                    0,
+                    float(nx),
+                    float(ny),
+                )
+                x11.XFlush(dpy)
+
+        if dropped:
+            with self.confiner._lock:
+                for mid in dropped:
+                    self.confiner.release(mid)
 
 
 class PointerConfiner:
@@ -30,46 +195,22 @@ class PointerConfiner:
         self._root = None
         self._x11 = self._xfixes = self._xi = None
         self._barriers: Dict[int, List[int]] = {}
+        self._confined_rects: Dict[int, Tuple[int, int, int, int]] = {}
+        self.watchdog = ConfinementWatchdog(self)
+
+    def start_watchdog(self):
+        self.watchdog.start()
+
+    def stop_watchdog(self):
+        self.watchdog.stop()
 
     # ------------------------------------------------------------------
     def _open(self) -> bool:
         if self._dpy:
             return True
         try:
-            x11 = ctypes.CDLL(ctypes.util.find_library("X11") or "libX11.so.6")
-            xfixes = ctypes.CDLL(ctypes.util.find_library("Xfixes") or "libXfixes.so.3")
-            xi = ctypes.CDLL(ctypes.util.find_library("Xi") or "libXi.so.6")
-
-            x11.XInitThreads.restype = ctypes.c_int
-            x11.XInitThreads()
-            x11.XOpenDisplay.restype = ctypes.c_void_p
-            x11.XOpenDisplay.argtypes = [ctypes.c_char_p]
-            x11.XDefaultRootWindow.restype = ctypes.c_ulong
-            x11.XDefaultRootWindow.argtypes = [ctypes.c_void_p]
-            x11.XFlush.argtypes = [ctypes.c_void_p]
-            x11.XSync.argtypes = [ctypes.c_void_p, ctypes.c_int]
-
-            xfixes.XFixesQueryVersion.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int)]
-            xfixes.XFixesCreatePointerBarrier.restype = ctypes.c_ulong
-            xfixes.XFixesCreatePointerBarrier.argtypes = [
-                ctypes.c_void_p, ctypes.c_ulong,
-                ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
-                ctypes.c_int, ctypes.c_int, ctypes.POINTER(ctypes.c_int),
-            ]
-            xfixes.XFixesDestroyPointerBarrier.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
-
-            xi.XIWarpPointer.argtypes = [
-                ctypes.c_void_p, ctypes.c_int, ctypes.c_ulong, ctypes.c_ulong,
-                ctypes.c_double, ctypes.c_double, ctypes.c_uint, ctypes.c_uint,
-                ctypes.c_double, ctypes.c_double,
-            ]
-
-            xi.XISetClientPointer.restype = ctypes.c_int
-            xi.XISetClientPointer.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.c_int]
-            xi.XISetFocus.restype = ctypes.c_int
-            xi.XISetFocus.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_ulong, ctypes.c_ulong]
-
-            dpy = x11.XOpenDisplay(None)
+            x11, xi, xfixes = load_x11()
+            dpy = open_display()
             if not dpy:
                 logger.error("Pointer barriers: cannot open X display (is DISPLAY set / are you on X11?).")
                 return False
@@ -91,12 +232,15 @@ class PointerConfiner:
     # ------------------------------------------------------------------
     def release(self, master_id: int):
         with self._lock:
+            self._confined_rects.pop(master_id, None)
             ids = self._barriers.pop(master_id, [])
             if not ids or not self._dpy:
                 return
             for b in ids:
                 self._xfixes.XFixesDestroyPointerBarrier(self._dpy, b)
             self._x11.XFlush(self._dpy)
+            if not self._confined_rects:
+                self.stop_watchdog()
 
     def set_client_pointer(self, window_id, master_pointer_id: int) -> bool:
         """
@@ -134,7 +278,9 @@ class PointerConfiner:
             return True
 
     def release_all(self):
+        self.stop_watchdog()
         with self._lock:
+            self._confined_rects.clear()
             for mid in list(self._barriers.keys()):
                 self.release(mid)
 
@@ -154,16 +300,7 @@ class PointerConfiner:
             self._xi.XIWarpPointer(self._dpy, master_id, 0, self._root,
                                    0.0, 0.0, 0, 0, float(x + w // 2), float(y + h // 2))
 
-            tw, th = total_screen or (0, 0)
-            edges = []
-            if x > 0:
-                edges.append((x, y, x, y + h, POSITIVE_X))            # left edge: allow entering
-            if tw == 0 or x + w < tw:
-                edges.append((x + w, y, x + w, y + h, NEGATIVE_X))    # right edge
-            if y > 0:
-                edges.append((x, y, x + w, y, POSITIVE_Y))            # top edge
-            if th == 0 or y + h < th:
-                edges.append((x, y + h, x + w, y + h, NEGATIVE_Y))    # bottom edge
+            edges = compute_barrier_edges(x, y, w, h, total_screen)
 
             devs = (ctypes.c_int * 1)(master_id)
             created = []
@@ -172,6 +309,8 @@ class PointerConfiner:
                     self._dpy, self._root, x1, y1, x2, y2, allowed, 1, devs)
                 created.append(bid)
             self._barriers[master_id] = created
+            self._confined_rects[master_id] = (x, y, w, h)
             self._x11.XSync(self._dpy, 0)
             logger.info(f"Confined master pointer {master_id} to {w}x{h}+{x}+{y} ({len(created)} barriers).")
+            self.start_watchdog()
             return True

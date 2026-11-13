@@ -143,7 +143,7 @@ class DashboardTab(Gtk.Box):
             autostart_on = is_autostart_enabled()
 
             GLib.idle_add(self._update_ui_cards, num_seats, num_masters, num_displays, running_kiosks, autostart_on)
-        except Exception as exc:
+        except Exception:
             pass
 
     def _update_ui_cards(self, seats, masters, displays, kiosks, autostart_on=False):
@@ -196,6 +196,15 @@ class DashboardTab(Gtk.Box):
                 btn.set_active(True)
                 self._updating_autostart_ui = False
 
+    def _show_display_dialog_and_retry(self):
+        from gui.display_dialog import DisplayDialog
+        dlg = DisplayDialog(
+            mode="error",
+            on_success_callback=lambda _: self._on_start_all(None),
+        )
+        dlg.set_transient_for(self.app)
+        dlg.show_all()
+
     # -----------------------------------------------------------------------
     # Toolbar Actions
     # -----------------------------------------------------------------------
@@ -204,16 +213,20 @@ class DashboardTab(Gtk.Box):
         self.app.show_info("Checking display hardware and applying seat mappings...", 0)
 
         def _worker():
-            from core.session_manager import session_mgr
-            ok, msg = session_mgr.start_session(on_event=lambda m: self.append_log(m))
-            if ok:
-                GLib.idle_add(self.app.hotkey_mgr.update_seat_keyboards, self.app.seating_engine.seat_keyboards)
+            from core.session_manager import session_mgr, StartResult
+            res = session_mgr.start_session(on_event=lambda m: self.append_log(m), allow_partial=True)
+            if res.ok:
+                if self.app.hotkey_mgr:
+                    GLib.idle_add(self.app.hotkey_mgr.update_seat_keyboards, self.app.seating_engine.seat_keyboards)
                 self.append_log("Dual Firefox kiosks launched successfully.")
                 self.append_log("⚡ Super Shortcut active: Press Ctrl + Shift + M + S on any seat to overlay control panel on your screen.")
                 GLib.idle_add(self.app.show_info, "Pseudo-seating active! Dual Firefox kiosks running (Ctrl+Shift+M+S to overlay).", 0)
+            elif res.code == StartResult.NEED_DISPLAYS:
+                self.append_log(f"Start notice: {res.message}")
+                GLib.idle_add(self._show_display_dialog_and_retry)
             else:
-                self.append_log(f"Start notice: {msg}")
-                GLib.idle_add(self.app.show_info, msg, 1)
+                self.append_log(f"Start notice: {res.message}")
+                GLib.idle_add(self.app.show_info, res.message, 1)
 
             GLib.idle_add(self.refresh_metrics)
 
@@ -235,7 +248,7 @@ class DashboardTab(Gtk.Box):
         self.append_log("Restarting Firefox kiosks...")
         def _worker():
             from core.session_manager import session_mgr
-            session_mgr.restart_session(on_event=lambda m: self.append_log(m))
+            session_mgr.restart_session(on_event=lambda m: self.append_log(m), allow_partial=True)
             self.append_log("Dual kiosks restarted.")
             GLib.idle_add(self.refresh_metrics)
         threading.Thread(target=_worker, daemon=True).start()

@@ -15,8 +15,15 @@ import threading
 import time
 from typing import Callable, Dict, Optional, Set
 
-from core.hotkey_manager import (_XEvent, _XGenericEventCookie, _XIEventMask, _XIRawEvent,
-                                 resolve_seat_for_device)
+from core.hotkey_manager import resolve_seat_for_device
+from core.x11 import (
+    _XEvent,
+    _XGenericEventCookie,
+    _XIEventMask,
+    _XIRawEvent,
+    load_x11,
+    open_display,
+)
 
 logger = logging.getLogger("xinput_seating.combo")
 
@@ -105,36 +112,13 @@ class ComboHotkey:
 
     def _loop(self):
         try:
-            x11 = ctypes.CDLL(ctypes.util.find_library("X11") or "libX11.so.6")
-            xi = ctypes.CDLL(ctypes.util.find_library("Xi") or "libXi.so.6")
-            x11.XInitThreads()
-            x11.XOpenDisplay.restype = ctypes.c_void_p
-            x11.XOpenDisplay.argtypes = [ctypes.c_char_p]
-            dpy = x11.XOpenDisplay(None)
+            x11, xi, _ = load_x11()
+            dpy = open_display()
             if not dpy:
                 logger.error("Combo hotkey: cannot open X display.")
                 return
-            x11.XDefaultRootWindow.restype = ctypes.c_ulong
-            x11.XDefaultRootWindow.argtypes = [ctypes.c_void_p]
             root = x11.XDefaultRootWindow(dpy)
-            x11.XConnectionNumber.restype = ctypes.c_int
-            x11.XConnectionNumber.argtypes = [ctypes.c_void_p]
             fd = x11.XConnectionNumber(dpy)
-            x11.XPending.restype = ctypes.c_int
-            x11.XPending.argtypes = [ctypes.c_void_p]
-            x11.XKeycodeToKeysym.restype = ctypes.c_ulong
-            x11.XKeycodeToKeysym.argtypes = [ctypes.c_void_p, ctypes.c_ubyte, ctypes.c_int]
-            x11.XGetEventData.restype = ctypes.c_int
-            x11.XGetEventData.argtypes = [ctypes.c_void_p, ctypes.POINTER(_XGenericEventCookie)]
-            x11.XFreeEventData.argtypes = [ctypes.c_void_p, ctypes.POINTER(_XGenericEventCookie)]
-            x11.XNextEvent.argtypes = [ctypes.c_void_p, ctypes.POINTER(_XEvent)]
-            x11.XFlush.argtypes = [ctypes.c_void_p]
-            x11.XCloseDisplay.argtypes = [ctypes.c_void_p]
-            x11.XQueryExtension.restype = ctypes.c_int
-            x11.XQueryExtension.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.POINTER(ctypes.c_int),
-                                            ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int)]
-            xi.XISelectEvents.restype = ctypes.c_int
-            xi.XISelectEvents.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.POINTER(_XIEventMask), ctypes.c_int]
 
             opcode = ctypes.c_int(0)
             if not x11.XQueryExtension(dpy, b"XInputExtension", ctypes.byref(opcode),
@@ -144,10 +128,6 @@ class ComboHotkey:
                 return
 
             # Resolve the live keycodes of Ctrl / Shift / M / <letter>
-            x11.XStringToKeysym.restype = ctypes.c_ulong
-            x11.XStringToKeysym.argtypes = [ctypes.c_char_p]
-            x11.XKeysymToKeycode.restype = ctypes.c_ubyte
-            x11.XKeysymToKeycode.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
             for sym, group in ((b"Control_L", "CTRL"), (b"Control_R", "CTRL"), (b"Shift_L", "SHIFT"),
                                (b"Shift_R", "SHIFT"), (b"m", "M"), (self.letter.encode(), "KEY")):
                 kc = x11.XKeysymToKeycode(dpy, x11.XStringToKeysym(sym))

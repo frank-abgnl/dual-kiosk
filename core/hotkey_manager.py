@@ -17,12 +17,19 @@ import logging
 import threading
 import subprocess
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Set, Tuple
+from typing import Callable, Dict, List, Optional, Set, Tuple, Union
 
 logger = logging.getLogger("xinput_seating.hotkey")
 
-CONFIG_DIR = Path.home() / ".config" / "xinput-seats"
-SOCKET_PATH = CONFIG_DIR / "overlay.sock"
+from core.paths import SOCKET_PATH
+from core.x11 import (
+    _XEvent,
+    _XGenericEventCookie,
+    _XIEventMask,
+    _XIRawEvent,
+    load_x11,
+    open_display,
+)
 PROJECT_DIR = Path(__file__).resolve().parent.parent
 MAIN_PY = PROJECT_DIR / "main.py"
 
@@ -75,12 +82,24 @@ class OverlayIPCServer:
         self._thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
 
-    def start(self):
-        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-        try:
-            SOCKET_PATH.unlink(missing_ok=True)
-        except Exception:
-            pass
+    def start(self) -> bool:
+        SOCKET_PATH.parent.mkdir(parents=True, exist_ok=True)
+        if SOCKET_PATH.exists():
+            try:
+                with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as probe:
+                    probe.settimeout(0.5)
+                    probe.connect(str(SOCKET_PATH))
+                    probe.sendall(b"PING\n")
+                    resp = probe.recv(64).decode("utf-8", errors="ignore").strip()
+                    if resp in ("PONG", "OK"):
+                        logger.warning(f"Overlay IPC socket at {SOCKET_PATH} is already active; another GUI is running.")
+                        return False
+            except Exception:
+                # Stale socket, unlink
+                try:
+                    SOCKET_PATH.unlink(missing_ok=True)
+                except Exception:
+                    pass
 
         try:
             self._sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -90,12 +109,13 @@ class OverlayIPCServer:
         except Exception as exc:
             logger.error(f"Failed to bind overlay IPC socket at {SOCKET_PATH}: {exc}")
             self._sock = None
-            return
+            return False
 
         self._stop_event.clear()
         self._thread = threading.Thread(target=self._server_loop, daemon=True, name="OverlayIPCServer")
         self._thread.start()
         logger.info(f"Overlay IPC server listening on {SOCKET_PATH}")
+        return True
 
     def stop(self):
         self._stop_event.set()
@@ -129,12 +149,15 @@ class OverlayIPCServer:
                     data = conn.recv(1024).decode("utf-8", errors="ignore").strip()
                     if data:
                         logger.info(f"IPC server received command: {data}")
-                        try:
-                            self.on_command(data)
-                            conn.sendall(b"OK\n")
-                        except Exception as exc:
-                            logger.error(f"Error handling IPC command '{data}': {exc}")
-                            conn.sendall(b"ERR\n")
+                        if data == "PING":
+                            conn.sendall(b"PONG\n")
+                        else:
+                            try:
+                                self.on_command(data)
+                                conn.sendall(b"OK\n")
+                            except Exception as exc:
+                                logger.error(f"Error handling IPC command '{data}': {exc}")
+                                conn.sendall(b"ERR\n")
             except (BlockingIOError, socket.error):
                 continue
             except Exception as exc:
@@ -149,12 +172,20 @@ def resolve_seat_for_device(
     master_id: int,
     slave_id: int,
     seats: Optional[List[Dict]] = None,
-    seat_keyboards: Optional[Dict[str, int]] = None,
+    seat_keyboards: Optional[Union[Dict[str, int], Callable[[], Dict[str, int]]]] = None,
 ) -> str:
     """
     Determines which seat triggered a hotkey event based on the master keyboard ID,
     slave device ID, USB hierarchy, or seat configurations.
     """
+    if callable(seat_keyboards):
+        try:
+            kbds = seat_keyboards()
+        except Exception:
+            kbds = None
+    else:
+        kbds = seat_keyboards
+
     if seats is None:
         try:
             from core.config_manager import ConfigManager
@@ -163,8 +194,8 @@ def resolve_seat_for_device(
             seats = []
 
     # 1. Match active master keyboard ID
-    if seat_keyboards:
-        for sid, kbd_id in seat_keyboards.items():
+    if kbds:
+        for sid, kbd_id in kbds.items():
             if kbd_id == master_id:
                 return sid
 
@@ -238,52 +269,7 @@ def get_seat_screen_geometry(
     return 0, 0, 1024, 768, "default"
 
 
-# ---------------------------------------------------------------------------
-# XInput 2 Ctypes Structures
-# ---------------------------------------------------------------------------
-class _XIEventMask(ctypes.Structure):
-    _fields_ = [
-        ("deviceid", ctypes.c_int),
-        ("mask_len", ctypes.c_int),
-        ("mask", ctypes.POINTER(ctypes.c_ubyte)),
-    ]
 
-
-class _XGenericEventCookie(ctypes.Structure):
-    _fields_ = [
-        ("type", ctypes.c_int),
-        ("serial", ctypes.c_ulong),
-        ("send_event", ctypes.c_int),
-        ("display", ctypes.c_void_p),
-        ("extension", ctypes.c_int),
-        ("evtype", ctypes.c_int),
-        ("cookie", ctypes.c_uint),
-        ("data", ctypes.c_void_p),
-    ]
-
-
-class _XIRawEvent(ctypes.Structure):
-    _fields_ = [
-        ("type", ctypes.c_int),
-        ("serial", ctypes.c_ulong),
-        ("send_event", ctypes.c_int),
-        ("display", ctypes.c_void_p),
-        ("extension", ctypes.c_int),
-        ("evtype", ctypes.c_int),
-        ("time", ctypes.c_ulong),
-        ("deviceid", ctypes.c_int),
-        ("sourceid", ctypes.c_int),
-        ("detail", ctypes.c_int),  # Keycode
-        ("flags", ctypes.c_int),
-    ]
-
-
-class _XEvent(ctypes.Union):
-    _fields_ = [
-        ("type", ctypes.c_int),
-        ("xcookie", _XGenericEventCookie),
-        ("pad", ctypes.c_long * 24),
-    ]
 
 
 # ---------------------------------------------------------------------------
@@ -305,19 +291,30 @@ class HotkeyManager:
         on_trigger: Optional[Callable[[str, int, int], None]] = None,
         on_device_changed: Optional[Callable[[], None]] = None,
         launch_gui_if_needed: bool = False,
-        seat_keyboards: Optional[Dict[str, int]] = None,
+        seat_keyboards: Optional[Union[Dict[str, int], Callable[[], Dict[str, int]]]] = None,
+        get_seat_keyboards: Optional[Callable[[], Dict[str, int]]] = None,
     ):
         """
         Args:
             on_trigger: Optional callback(seat_id, master_id, slave_id) when shortcut fires.
             on_device_changed: Optional callback() when devices are plugged or unplugged.
             launch_gui_if_needed: If True and no running GUI responds to IPC, launch the GUI process.
-            seat_keyboards: Optional map of seat_id -> master keyboard ID.
+            seat_keyboards: Optional map of seat_id -> master keyboard ID or dynamic provider callable.
+            get_seat_keyboards: Optional dynamic provider callable returning seat_id -> master keyboard ID.
         """
         self.on_trigger = on_trigger
         self.on_device_changed = on_device_changed
         self.launch_gui_if_needed = launch_gui_if_needed
-        self.seat_keyboards = seat_keyboards or {}
+
+        if callable(seat_keyboards):
+            self.get_seat_keyboards = seat_keyboards
+            self.seat_keyboards = {}
+        elif get_seat_keyboards is not None:
+            self.get_seat_keyboards = get_seat_keyboards
+            self.seat_keyboards = seat_keyboards or {}
+        else:
+            self.get_seat_keyboards = None
+            self.seat_keyboards = seat_keyboards or {}
 
         self._thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
@@ -427,57 +424,14 @@ class HotkeyManager:
     def _listener_loop(self):
         """XInput 2 raw event polling loop."""
         try:
-            x11 = ctypes.CDLL(ctypes.util.find_library("X11") or "libX11.so.6")
-            xi = ctypes.CDLL(ctypes.util.find_library("Xi") or "libXi.so.6")
-
-            x11.XInitThreads.restype = ctypes.c_int
-            x11.XInitThreads()
-
-            x11.XOpenDisplay.restype = ctypes.c_void_p
-            x11.XOpenDisplay.argtypes = [ctypes.c_char_p]
-            dpy = x11.XOpenDisplay(None)
+            x11, xi, _ = load_x11()
+            dpy = open_display()
             if not dpy:
                 logger.error("Hotkey listener: Cannot open X11 Display.")
                 return
 
-            x11.XDefaultRootWindow.restype = ctypes.c_ulong
-            x11.XDefaultRootWindow.argtypes = [ctypes.c_void_p]
             root = x11.XDefaultRootWindow(dpy)
-
-            x11.XConnectionNumber.restype = ctypes.c_int
-            x11.XConnectionNumber.argtypes = [ctypes.c_void_p]
             fd = x11.XConnectionNumber(dpy)
-
-            x11.XPending.restype = ctypes.c_int
-            x11.XPending.argtypes = [ctypes.c_void_p]
-
-            x11.XKeycodeToKeysym.restype = ctypes.c_ulong
-            x11.XKeycodeToKeysym.argtypes = [ctypes.c_void_p, ctypes.c_ubyte, ctypes.c_int]
-
-            x11.XGetEventData.restype = ctypes.c_int
-            x11.XGetEventData.argtypes = [ctypes.c_void_p, ctypes.POINTER(_XGenericEventCookie)]
-            x11.XFreeEventData.argtypes = [ctypes.c_void_p, ctypes.POINTER(_XGenericEventCookie)]
-            x11.XNextEvent.argtypes = [ctypes.c_void_p, ctypes.POINTER(_XEvent)]
-
-            xi.XISelectEvents.restype = ctypes.c_int
-            xi.XISelectEvents.argtypes = [
-                ctypes.c_void_p,
-                ctypes.c_ulong,
-                ctypes.POINTER(_XIEventMask),
-                ctypes.c_int,
-            ]
-
-            x11.XCloseDisplay.argtypes = [ctypes.c_void_p]
-            x11.XFlush.argtypes = [ctypes.c_void_p]
-
-            x11.XQueryExtension.restype = ctypes.c_int
-            x11.XQueryExtension.argtypes = [
-                ctypes.c_void_p,
-                ctypes.c_char_p,
-                ctypes.POINTER(ctypes.c_int),
-                ctypes.POINTER(ctypes.c_int),
-                ctypes.POINTER(ctypes.c_int),
-            ]
 
             # Query XInput extension opcode
             xi_opcode = ctypes.c_int(0)
@@ -592,7 +546,8 @@ class HotkeyManager:
 
     def _handle_shortcut_trigger(self, master_id: int, slave_id: int):
         """Called when Ctrl + Shift + M + S is hit on an input device."""
-        seat_id = resolve_seat_for_device(master_id, slave_id, seat_keyboards=self.seat_keyboards)
+        kbds_provider = self.get_seat_keyboards if self.get_seat_keyboards is not None else self.seat_keyboards
+        seat_id = resolve_seat_for_device(master_id, slave_id, seat_keyboards=kbds_provider)
         logger.info(
             f"Super Shortcut triggered! Master={master_id}, Slave={slave_id} -> Seat '{seat_id}'"
         )
