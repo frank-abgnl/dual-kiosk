@@ -93,3 +93,72 @@ def test_sleep_and_wake_seat_calls_reattach():
         reattach_9 = any(c[:3] == ["xinput", "reattach", "9"] for c in commands)
         assert reattach_8, "Expected xinput reattach for device 8"
         assert reattach_9, "Expected xinput reattach for device 9"
+
+
+def test_get_xinput_hierarchy_basic():
+    """Verify fixture xinput_list_basic.txt parses basic core pointer and keyboard with slaves."""
+    fixture = (Path(__file__).parent / "fixtures" / "xinput_list_basic.txt").read_text(encoding="utf-8")
+    dm = DeviceManager()
+
+    with patch("core.device_manager.run_command", return_value=(fixture, "", 0)):
+        masters, pointers, keyboards = dm.get_xinput_hierarchy()
+
+    assert "2" in masters
+    assert masters["2"]["name"] == "Virtual core pointer"
+    assert "3" in masters
+    assert masters["3"]["name"] == "Virtual core keyboard"
+
+    p_ids = [p["id"] for p in pointers]
+    assert 4 in p_ids  # XTEST pointer
+    assert 6 in p_ids  # Dell Optical USB Mouse
+
+    k_ids = [k["id"] for k in keyboards]
+    assert 5 in k_ids  # XTEST keyboard
+    assert 7 in k_ids  # Dell USB Keyboard
+
+
+def test_get_xinput_hierarchy_two_masters():
+    """Verify fixture xinput_list_two_masters.txt parses both core and Seat_SEAT2 master pairs."""
+    fixture = (Path(__file__).parent / "fixtures" / "xinput_list_two_masters.txt").read_text(encoding="utf-8")
+    dm = DeviceManager()
+
+    with patch("core.device_manager.run_command", return_value=(fixture, "", 0)):
+        masters, pointers, keyboards = dm.get_xinput_hierarchy()
+
+    assert "2" in masters
+    assert "10" in masters
+    assert masters["10"]["name"] == "Seat_SEAT2 pointer"
+    assert "11" in masters
+    assert masters["11"]["name"] == "Seat_SEAT2 keyboard"
+
+    # Check that slave pointer 8 attached to Seat_SEAT2 pointer (10)
+    hp_mouse = next(p for p in pointers if p["id"] == 8)
+    assert hp_mouse["attachment"] == 10
+    assert hp_mouse["name"] == "HP USB Optical Mouse"
+
+    # Check that slave keyboard 9 attached to Seat_SEAT2 keyboard (11)
+    hp_kbd = next(k for k in keyboards if k["id"] == 9)
+    assert hp_kbd["attachment"] == 11
+    assert hp_kbd["name"] == "HP USB Keyboard"
+
+
+def test_get_xinput_hierarchy_names_with_spaces_and_unicode():
+    """Verify hierarchy parsing handles complex device names with multiple spaces and unicode."""
+    sample = """⎡ Virtual core pointer                    \tid=2\t[master pointer  (3)]
+⎜   ↳ ゲーミングマウス Gaming Mouse ★ \tid=12\t[slave  pointer  (2)]
+⎣ Virtual core keyboard                   \tid=3\t[master keyboard (2)]
+    ↳ USB 키보드 (Mechanical Keyboard) \tid=13\t[slave  keyboard (3)]
+"""
+    dm = DeviceManager()
+
+    with patch("core.device_manager.run_command", return_value=(sample, "", 0)):
+        masters, pointers, keyboards = dm.get_xinput_hierarchy()
+
+    u_ptr = next(p for p in pointers if p["id"] == 12)
+    assert "ゲーミングマウス" in u_ptr["name"]
+    assert "★" in u_ptr["name"]
+    assert u_ptr["attachment"] == 2
+
+    u_kbd = next(k for k in keyboards if k["id"] == 13)
+    assert "키보드" in u_kbd["name"]
+    assert u_kbd["attachment"] == 3

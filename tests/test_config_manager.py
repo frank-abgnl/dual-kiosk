@@ -77,3 +77,68 @@ def test_concurrent_updates(tmp_path):
 
     final = mgr.load_config()
     assert final["settings"]["counter"] == 60
+
+
+def test_concurrent_updates_8_threads_different_keys(tmp_path):
+    """Verify 8 concurrent threads each updating a different key leaves all 8 keys present."""
+    cfg_file = tmp_path / "config.json"
+    mgr = ConfigManager(cfg_file)
+    mgr.save_config({"version": "1.0", "seats": [], "settings": {}})
+
+    def worker(key_idx):
+        def mutator(c):
+            c["settings"][f"thread_key_{key_idx}"] = f"val_{key_idx}"
+        mgr.update(mutator)
+
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    final = mgr.load_config()
+    for i in range(8):
+        assert final["settings"].get(f"thread_key_{i}") == f"val_{i}"
+
+
+def test_config_migration(tmp_path):
+    """Verify loading legacy config migrates volatile runtime keys to runtime.json."""
+    cfg_file = tmp_path / "config.json"
+    runtime_file = tmp_path / "runtime.json"
+    legacy_cfg = {
+        "seats": [
+            {
+                "id": "seat1",
+                "mouse_id": 5,
+                "keyboard_id": 6,
+                "mouse_name": "Optical Mouse",
+                "keyboard_name": "USB Keyboard",
+                "display": "HDMI-1",
+                "resolution": "1920x1080",
+                "display_layout": "1920x1080+0+0",
+            }
+        ],
+        "settings": {"auto_start": True},
+    }
+    cfg_file.write_text(json.dumps(legacy_cfg))
+
+    from unittest.mock import patch
+    with patch("core.paths.RUNTIME_FILE", runtime_file):
+        mgr = ConfigManager(cfg_file)
+        loaded = mgr.load_config(include_runtime=False)
+
+        # Volatile IDs removed from config
+        assert "mouse_id" not in loaded["seats"][0]
+        assert "keyboard_id" not in loaded["seats"][0]
+        assert "version" in loaded
+
+        # Verify disk file contains no numeric device IDs
+        disk_cfg = json.loads(cfg_file.read_text())
+        assert "mouse_id" not in disk_cfg["seats"][0]
+        assert "keyboard_id" not in disk_cfg["seats"][0]
+
+        # Moved to runtime.json
+        assert runtime_file.exists()
+        rt = json.loads(runtime_file.read_text())
+        assert rt["seats"]["seat1"]["mouse_id"] == 5
+        assert rt["seats"]["seat1"]["keyboard_id"] == 6
