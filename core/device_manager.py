@@ -2,6 +2,7 @@
 """
 Device Manager for XInput Pseudo-Seating.
 Discovers displays (via xrandr/DRM) and input devices (via xinput and sysfs).
+Only real, user-facing hardware (keyboards, mice, physical displays) is reported.
 """
 
 import subprocess
@@ -13,7 +14,13 @@ from pathlib import Path
 import time
 from typing import Dict, List, Optional, Tuple, Set
 
+from core.peripheral_resolver import _denied  # name deny-list (power button, consumer control, webcam, ...)
+
 logger = logging.getLogger("xinput_seating.device_manager")
+
+VIRTUAL_DISPLAY_RE = re.compile(r"(?i)^(virtual|none-|writeback)")
+MIN_KEYBOARD_KEYS = 60     # real keyboards report 80+; extra HID nodes report a handful
+MIN_MOUSE_BUTTONS = 3
 
 
 def run_command(args, timeout=5, check=False):
@@ -45,7 +52,9 @@ class DeviceManager:
     _displays_cache_ts: float = 0.0
     _hierarchy_cache: Optional[Tuple[Dict, List[Dict], List[Dict]]] = None
     _hierarchy_cache_ts: float = 0.0
+    _probe_cache: Dict[Tuple[int, str], Tuple[float, Dict]] = {}
     CACHE_TTL: float = 2.0
+    PROBE_TTL: float = 10.0
 
     @classmethod
     def clear_cache(cls):
@@ -54,13 +63,11 @@ class DeviceManager:
         cls._displays_cache_ts = 0.0
         cls._hierarchy_cache = None
         cls._hierarchy_cache_ts = 0.0
+        cls._probe_cache = {}
 
     def __init__(self):
         pass
 
-    # -----------------------------------------------------------------------
-    # Display Discovery
-    # -----------------------------------------------------------------------
     # -----------------------------------------------------------------------
     # Display Discovery & Auto-Assignment
     # -----------------------------------------------------------------------
@@ -149,7 +156,8 @@ class DeviceManager:
 
     def get_displays(self, force: bool = False):
         """
-        Discovers connected video displays using xrandr, falling back to sysfs DRM.
+        Discovers connected physical video displays using xrandr, falling back to sysfs DRM.
+        Virtual / dummy / writeback connectors are ignored.
         Returns a list of dicts:
         [{
             'name': 'eDP-1',
@@ -249,6 +257,9 @@ class DeviceManager:
                         "active": True,
                     })
 
+        # Ignore virtual / dummy / writeback connectors (not real monitors)
+        displays = [d for d in displays if not VIRTUAL_DISPLAY_RE.match(d["name"])]
+
         # Sort displays: primary first, then left-to-right by X coordinate
         displays.sort(key=lambda d: (not d.get("primary", False), d.get("x", 0)))
         DeviceManager._displays_cache = (displays, total_screen)
@@ -276,6 +287,117 @@ class DeviceManager:
         self._floating_class_cache[dev_id] = cls
         return cls
 
+    # -----------------------------------------------------------------------
+    # Physical-device filtering (ignore power buttons, consumer control, sibling nodes...)
+    # -----------------------------------------------------------------------
+    @staticmethod
+    def _bus_of(dev_id: int) -> Tuple[str, Optional[str]]:
+        """Returns ('usb', sysfs_path) | ('internal', None) | ('unknown', None)."""
+        out, _, rc = run_command(["xinput", "list-props", str(dev_id)])
+        if rc != 0 or not out:
+            return "unknown", None
+        m = re.search(r'Device Node \(\d+\):\s*"([^"]+)"', out)
+        if not m:
+            return "unknown", None
+        try:
+            start = Path(f"/sys/class/input/{Path(m.group(1)).name}/device").resolve()
+        except OSError:
+            return "unknown", None
+        # During a (re)plug the sysfs link may not exist yet: resolve() then stays under
+        # /sys/class and tells us nothing, so report 'unknown' (device is kept).
+        if not str(start).startswith("/sys/devices"):
+            return "unknown", None
+        cur = start
+        while cur != cur.parent and str(cur) != "/sys":
+            if (cur / "idVendor").exists():
+                return "usb", str(cur)
+            cur = cur.parent
+        if "/usb" in str(start):
+            return "unknown", None   # on a USB path but descriptor not readable yet
+        return "internal", None
+
+    def _probe_node(self, dev: Dict) -> Dict:
+        """
+        Returns {'keys', 'buttons', 'bus', 'usb_parent', 'conclusive'} for an xinput node.
+        Only the static capability counts (keys / buttons) are cached, per device name+class,
+        and only when the probe succeeded. Bus / USB parent are looked up fresh every time:
+        xinput IDs are recycled and sysfs may not be ready right after a replug, so caching
+        them could wrongly drop a freshly replugged device.
+        """
+        ckey = (dev["name"], dev.get("class", ""))
+        now = time.time()
+        hit = DeviceManager._probe_cache.get(ckey)
+        if hit and now - hit[0] < self.PROBE_TTL:
+            keys, buttons = hit[1]
+            conclusive = True
+        else:
+            out, _, rc = run_command(["xinput", "list", str(dev["id"])])
+            # Modern xinput: "Keycodes supported: 248"; legacy xinput: "Reporting 248 keys"
+            m_k = (re.search(r"Keycodes supported:\s*(\d+)", out)
+                   or re.search(r"Reporting (\d+) keys", out))
+            m_b = re.search(r"Buttons supported:\s*(\d+)", out)
+            keys = int(m_k.group(1)) if m_k else 0
+            buttons = int(m_b.group(1)) if m_b else 0
+            conclusive = rc == 0 and bool(out) and bool(m_k or m_b)
+            if conclusive:
+                DeviceManager._probe_cache[ckey] = (now, (keys, buttons))
+        bus, path = self._bus_of(dev["id"])
+        return {"keys": keys, "buttons": buttons, "bus": bus,
+                "usb_parent": path, "conclusive": conclusive}
+
+    @staticmethod
+    def _allow_internal() -> bool:
+        try:
+            from core.config_manager import ConfigManager
+            return bool(ConfigManager().load_config().get("settings", {}).get("allow_internal_input", False))
+        except Exception:
+            return False
+
+    def filter_physical(self, devices: List[Dict], dev_class: str) -> List[Dict]:
+        """
+        Keeps only real, user-facing keyboards / mice:
+          * drops XTEST, power/sleep buttons, consumer/system control, webcams, audio jacks...
+          * drops nodes that don't look like a real keyboard (<60 keys) or mouse (<3 buttons)
+          * drops non-USB devices (laptop keyboard/touchpad) unless settings.allow_internal_input
+          * collapses the several xinput nodes of ONE physical USB device into a single entry
+        Sibling nodes are still moved together with their primary by attach_with_siblings().
+        Nodes whose sysfs info cannot be read ('unknown') are kept so odd/floating devices don't vanish.
+        """
+        result = self._filter_physical(devices, dev_class, strict=True)
+        if not result:
+            # Safety net: if the key/button probe rejected everything (unexpected xinput
+            # output format), fall back to name deny-list + USB sibling dedupe only, so
+            # the launcher never gets stuck with zero keyboards / mice.
+            result = self._filter_physical(devices, dev_class, strict=False)
+            if result:
+                logger.warning(f"Strict {dev_class} filter found nothing; using relaxed filter.")
+        return result
+
+    def _filter_physical(self, devices: List[Dict], dev_class: str, strict: bool) -> List[Dict]:
+        allow_internal = self._allow_internal()
+        singles: List[Dict] = []
+        groups: Dict[str, Tuple[int, Dict]] = {}
+        for d in devices:
+            if d.get("is_xtest") or _denied(d["name"]):
+                continue
+            info = self._probe_node(d)
+            if strict and dev_class == "keyboard" and info["keys"] < MIN_KEYBOARD_KEYS and info["conclusive"] and info["bus"] != "unknown":
+                continue
+            if strict and dev_class == "pointer" and info["buttons"] < MIN_MOUSE_BUTTONS and info["conclusive"] and info["bus"] != "unknown":
+                continue
+            if info["bus"] == "internal" and not allow_internal:
+                continue
+            parent = info["usb_parent"]
+            if not parent:
+                singles.append(d)
+                continue
+            score = info["keys"] if dev_class == "keyboard" else info["buttons"]
+            best = groups.get(parent)
+            if best is None or score > best[0]:
+                groups[parent] = (score, d)
+        result = singles + [d for _, d in groups.values()]
+        return sorted(result, key=lambda d: d["id"])
+
     def get_xinput_hierarchy(self, force: bool = False):
         """
         Parses `xinput list` into a structured hierarchy of masters and slaves.
@@ -284,6 +406,7 @@ class DeviceManager:
             slaves_pointers: [dict, ...]
             slaves_keyboards: [dict, ...]
         Uses 2-second TTL cache unless force=True.
+        NOTE: this is the RAW hierarchy (all nodes). Use get_usable_* for real hardware only.
         """
         now = time.time()
         if not force and self._hierarchy_cache is not None and (now - self._hierarchy_cache_ts < self.CACHE_TTL):
@@ -369,14 +492,14 @@ class DeviceManager:
         )
 
     def get_usable_pointers(self):
-        """Returns non-XTEST slave pointers suitable for user assignment."""
+        """Real physical mice only (no XTEST / buttons / sibling nodes)."""
         _, pointers, _ = self.get_xinput_hierarchy()
-        return [p for p in pointers if not p["is_xtest"]]
+        return self.filter_physical(pointers, "pointer")
 
     def get_usable_keyboards(self):
-        """Returns non-XTEST slave keyboards suitable for user assignment."""
+        """Real physical keyboards only, one entry per physical device."""
         _, _, keyboards = self.get_xinput_hierarchy()
-        return [k for k in keyboards if not k["is_xtest"]]
+        return self.filter_physical(keyboards, "keyboard")
 
     # -----------------------------------------------------------------------
     # Sysfs & USB Hardware Correlation
@@ -384,6 +507,7 @@ class DeviceManager:
     def get_physical_input_devices(self):
         """
         Reads `/sys/class/input/` to detect physical USB/hardware input devices.
+        Non-hardware entries (power button, video bus, ...) are skipped.
         Returns a list of device dicts.
         """
         devices = []
@@ -396,6 +520,8 @@ class DeviceManager:
                 cap_file = inp_dir / "capabilities" / "key"
 
                 name = name_file.read_text().strip() if name_file.exists() else inp_dir.name
+                if _denied(name):
+                    continue
                 phys = phys_file.read_text().strip() if phys_file.exists() else ""
 
                 dev_type = "other"
@@ -443,12 +569,12 @@ class DeviceManager:
         return False
 
     def get_usb_pointers(self):
-        """Returns non-XTEST slave pointers that are physical USB devices."""
+        """Returns real slave pointers that are physical USB devices."""
         pointers = self.get_usable_pointers()
         return [p for p in pointers if self._is_usb_xinput(p["id"])]
 
     def get_usb_keyboards(self):
-        """Returns non-XTEST slave keyboards that are physical USB devices."""
+        """Returns real slave keyboards that are physical USB devices."""
         keyboards = self.get_usable_keyboards()
         return [k for k in keyboards if self._is_usb_xinput(k["id"])]
 

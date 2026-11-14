@@ -242,9 +242,6 @@ class XInputSeatingEngine:
         return ok
 
     # -----------------------------------------------------------------------
-    # Screen Confinement
-    # -----------------------------------------------------------------------
-    # -----------------------------------------------------------------------
     # Live device resolution (stable, one-to-one)
     # -----------------------------------------------------------------------
     def _seat_masters(self, seats_config: List[Dict]) -> Dict[str, Dict]:
@@ -302,9 +299,15 @@ class XInputSeatingEngine:
         return msgs
 
     def resolve_live(self, seats_config: List[Dict]):
-        """Maps saved seat peripherals to live xinput devices. Returns (resolved_seats, assignments)."""
+        """
+        Maps saved seat peripherals to live xinput devices. Returns (resolved_seats, assignments).
+        Only real physical keyboards / mice are offered to the resolver as candidates.
+        """
         from core.device_manager import DeviceManager
-        _, ptrs, kbds = DeviceManager().get_xinput_hierarchy()
+        dm = DeviceManager()
+        _, ptrs, kbds = dm.get_xinput_hierarchy()
+        ptrs = dm.filter_physical(ptrs, "pointer")
+        kbds = dm.filter_physical(kbds, "keyboard")
         resolved, assignments, events, _ = self.resolver.resolve(
             seats_config, ptrs, kbds, self._seat_masters(seats_config), self.memory)
         for m in self._handle_events(events):
@@ -597,8 +600,13 @@ class XInputSeatingEngine:
             self._verified_sig = sig  # give up on this exact state instead of looping
             return []
 
+        # ptrs / kbds stay RAW (sibling nodes are needed to move a keyboard as a whole);
+        # the resolver only gets real physical devices as candidates.
         resolved, assignments, events, spares = self.resolver.resolve(
-            seats_config, ptrs, kbds, self._seat_masters(seats_config), self.memory)
+            seats_config,
+            dm.filter_physical(ptrs, "pointer"),
+            dm.filter_physical(kbds, "keyboard"),
+            self._seat_masters(seats_config), self.memory)
 
         msgs: List[str] = self._handle_events(events)
         acted = deferred = False
@@ -673,7 +681,10 @@ class XInputSeatingEngine:
                         f"(no seat needs it)")
 
         self.memory.save()
-        if acted or deferred:
+        # A seat still missing a device may just be a replug that was not ready yet:
+        # re-check a few times (bounded by _attempts) instead of freezing this state.
+        retry = bool(self._absent)
+        if acted or deferred or retry:
             self._verified_sig = None                       # re-verify once our own changes settle
             self._attempts[sig] = self._attempts.get(sig, 0) + 1
         else:
@@ -771,4 +782,3 @@ class XInputSeatingEngine:
             if isinstance(master_ptr, int) and d and d.get("width") and d.get("height"):
                 geom = (d["width"], d["height"], d["x"], d["y"])
                 self.confine_master(master_ptr, geom, total_screen)
-
